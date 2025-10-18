@@ -4,6 +4,7 @@ import argparse
 import numpy as np
 import torch
 from glob import glob
+from tqdm import tqdm
 
 from mc3_frozen import FrozenMC3
 from video_windows import (
@@ -32,10 +33,11 @@ def main(args):
     if len(mp4s) == 0:
         print(f"[warn] no mp4 files found in {args.vid_dir}")
         return
+    print(f"→ Found {len(mp4s)} videos in {args.vid_dir}")
 
     use_amp = args.fp16 and (args.device == "cuda")
 
-    for mp4 in mp4s:
+    for mp4 in tqdm(mp4s, desc="Extracting video embeddings", unit="vid"):
         vid_id = os.path.splitext(os.path.basename(mp4))[0]
         out_npz = os.path.join(args.out_dir, f"{vid_id}.npz")
         if os.path.exists(out_npz) and not args.overwrite:
