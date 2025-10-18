@@ -4,29 +4,51 @@ import numpy as np
 import torch
 from typing import Tuple, Dict
 
-# Optional backend: Decord (GPU accelerated video reader)
 def read_video_decord(path, target_fps=24, size=224):
     """
-    Read a video using Decord (GPU-accelerated if available).
-    Returns tensor of shape (C, T, H, W), effective_fps, total_frames.
+    Returns (vid, eff_fps, T)
+      - vid: torch-like array shape (C,T,H,W) in uint8
+      - eff_fps: effective sampling fps
+      - T: number of sampled frames
     """
     from decord import VideoReader, cpu
-    import torch
-    import numpy as np
-    from torchvision import transforms
+    vr = VideoReader(path, ctx=cpu(0))
+    n_total = len(vr)
+    if n_total == 0:
+        return None, 0.0, 0
 
-    vr = VideoReader(path, ctx=cpu())
-    native_fps = vr.get_avg_fps()
-    indices = np.arange(0, len(vr), native_fps / target_fps).astype(int)
-    frames = vr.get_batch(indices).asnumpy()  # (T, H, W, 3)
+    native_fps = float(vr.get_avg_fps())
+    # Compute indices at target fps; always keep in bounds [0, n_total-1]
+    if target_fps is None or target_fps <= 0 or target_fps >= native_fps - 1e-6:
+        idx = np.arange(n_total, dtype=np.int64)
+    else:
+        step = native_fps / float(target_fps)
+        # floor prevents rounding up to n_total; clip for safety
+        idx = np.floor(np.arange(0, n_total, step)).astype(np.int64)
+        if idx.size == 0 or idx[0] != 0:
+            idx = np.insert(idx, 0, 0)
+        idx = np.clip(idx, 0, n_total - 1)
+        idx = np.unique(idx)  # strictly increasing within bounds
 
-    # Resize + normalize to torch tensor
-    transform = transforms.Compose([
-        transforms.ToTensor(),  # (C, H, W)
-        transforms.Resize((size, size)),
-    ])
-    vid = torch.stack([transform(f) for f in frames], dim=1)  # (C, T, H, W)
-    return vid, float(target_fps), len(frames)
+    # Guard very short videos
+    if idx.size == 0:
+        return None, 0.0, 0
+
+    # Batch extract (decord returns (T,H,W,3) uint8)
+    frames = vr.get_batch(idx).asnumpy()  # (T,H,W,3), uint8
+
+    # Resize to square 'size' with OpenCV
+    if size is not None and size > 0:
+        frames = np.stack([cv2.resize(f, (size, size), interpolation=cv2.INTER_AREA) for f in frames], axis=0)
+
+    # Convert to (C,T,H,W) uint8
+    frames = np.transpose(frames, (3, 0, 1, 2))
+
+    # Effective fps based on sampling density
+    duration_s = n_total / native_fps if native_fps > 0 else max(1, frames.shape[1]) / max(1, target_fps or 24)
+    eff_fps = frames.shape[1] / duration_s if duration_s > 0 else float(target_fps or native_fps)
+
+    return frames, float(eff_fps), int(frames.shape[1])
 
 def read_video_cv2(path: str, target_fps: int = 24, size: int = 224) -> Tuple[torch.Tensor, float, int]:
     """Read video, resample frames to ~target_fps, resize to square.
