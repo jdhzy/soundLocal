@@ -61,6 +61,15 @@ def main(args):
             vid, eff_fps = rv
             T = vid.shape[1] if vid is not None and hasattr(vid, "shape") else 0
 
+        import numpy as np, torch
+        if isinstance(vid, np.ndarray):
+            vid = torch.from_numpy(vid)  # uint8, (C,T,H,W)
+        elif not isinstance(vid, torch.Tensor):
+            raise TypeError(f"Unexpected video type: {type(vid)}")
+
+        if vid.dtype != torch.uint8:
+            vid = vid.to(torch.uint8)
+
         # Handle empty/failed decode
         if vid is None or T == 0:
             np.savez_compressed(
