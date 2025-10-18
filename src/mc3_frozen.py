@@ -55,13 +55,23 @@ class FrozenMC3(nn.Module):
             p.requires_grad = False
 
         # Preprocessing stats for normalization
-        self.img_mean = torch.tensor([0.43216, 0.394666, 0.37645], device=self.device).view(1, 3, 1, 1)
-        self.img_std = torch.tensor([0.22803, 0.22145, 0.216989], device=self.device).view(1, 3, 1, 1)
+        self.img_mean = torch.tensor([0.43216, 0.394666, 0.37645], device=self.device).view(1, 3, 1, 1, 1)
+        self.img_std  = torch.tensor([0.22803, 0.22145, 0.216989], device=self.device).view(1, 3, 1, 1, 1)
+        
+        
 
     @torch.inference_mode()
     def encode_video(self, clip):
-        """clip: (B,C,T,H,W) tensor in [0,1]."""
-        x = (clip - self.img_mean) / self.img_std
+        """clip: (B,C,T,H,W) or (B,T,C,H,W) in [0,1]."""
+        assert clip.dim() == 5, f"Expected 5D, got {clip.shape}"
+
+        # If channel is not dim=1 but dim=2, fix ordering
+        if clip.shape[1] != 3 and clip.shape[2] == 3:
+            clip = clip.permute(0, 2, 1, 3, 4).contiguous()  # (B, C, T, H, W)
+
+        # normalize with 5D stats
+        x = (clip - self.img_mean) / (self.img_std + 1e-8)
+
         feats = self.vid_backbone.stem(x)
         feats = self.vid_backbone.layer1(feats)
         feats = self.vid_backbone.layer2(feats)
