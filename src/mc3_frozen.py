@@ -109,15 +109,25 @@ class FrozenMC3(nn.Module):
         self._ensure_on_device()
 
         x = self._to_5d_chw(self._maybe_scale_uint(clip))
-        x = (x - self.img_mean) / (self.img_std + 1e-8)
+        # Move to GPU first
         x = x.to(self.device, memory_format=_CHANNELS_LAST_3D, non_blocking=True)
 
         use_amp = (self.device.type == "cuda")
         if use_amp:
             with torch.autocast(device_type="cuda", dtype=torch.float16):
+                # match dtype so broadcasting is safe under AMP
+                mean = self.img_mean.to(x.dtype)
+                std  = (self.img_std.to(x.dtype) + 1e-8)
+                x = (x - mean) / std
+
                 feats = self._forward_backbone(x)
         else:
+            mean = self.img_mean.to(x.dtype)
+            std  = (self.img_std.to(x.dtype) + 1e-8)
+            x = (x - mean) / std
+
             feats = self._forward_backbone(x)
+
         out = self.vid_head(feats)
         return out
 
