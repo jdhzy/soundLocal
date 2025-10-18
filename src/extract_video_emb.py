@@ -27,6 +27,11 @@ def parse_scales(s: str):
 
 def main(args):
     os.makedirs(args.out_dir, exist_ok=True)
+    # choose video reader
+    if args.backend == "decord":
+        from video_windows import read_video_decord as read_video_fn
+    else:
+        from video_windows import read_video_cv2 as read_video_fn
     model = FrozenMC3(device=args.device)
 
     mp4s = sorted(glob(os.path.join(args.vid_dir, "*.mp4")))
@@ -44,7 +49,7 @@ def main(args):
             continue
 
         # read video; be compatible with either 2-tuple or 3-tuple return
-        rv = read_video_cv2(mp4, target_fps=args.fps, size=args.size)
+        rv = read_video_fn(mp4, target_fps=args.fps, size=args.size)
         if isinstance(rv, tuple) and len(rv) == 3:
             vid, eff_fps, T = rv
         else:
@@ -120,7 +125,7 @@ def main(args):
         )
         print(f"✓ saved {out_npz} emb{embs.shape} windows={len(centers_s)} fps={eff_fps:.2f}")
 
-    if __name__ == "__main__":
+if __name__ == "__main__":
         ap = argparse.ArgumentParser()
         ap.add_argument("--vid_dir", default="data/ave/raw/AVE",
                         help="Directory containing video files (.mp4)")
