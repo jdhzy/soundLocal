@@ -4,6 +4,30 @@ import numpy as np
 import torch
 from typing import Tuple, Dict
 
+# Optional backend: Decord (GPU accelerated video reader)
+def read_video_decord(path, target_fps=24, size=224):
+    """
+    Read a video using Decord (GPU-accelerated if available).
+    Returns tensor of shape (C, T, H, W), effective_fps, total_frames.
+    """
+    from decord import VideoReader, cpu
+    import torch
+    import numpy as np
+    from torchvision import transforms
+
+    vr = VideoReader(path, ctx=cpu())
+    native_fps = vr.get_avg_fps()
+    indices = np.arange(0, len(vr), native_fps / target_fps).astype(int)
+    frames = vr.get_batch(indices).asnumpy()  # (T, H, W, 3)
+
+    # Resize + normalize to torch tensor
+    transform = transforms.Compose([
+        transforms.ToTensor(),  # (C, H, W)
+        transforms.Resize((size, size)),
+    ])
+    vid = torch.stack([transform(f) for f in frames], dim=1)  # (C, T, H, W)
+    return vid, float(target_fps), len(frames)
+
 def read_video_cv2(path: str, target_fps: int = 24, size: int = 224) -> Tuple[torch.Tensor, float, int]:
     """Read video, resample frames to ~target_fps, resize to square.
     Returns:
