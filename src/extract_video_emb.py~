@@ -1,0 +1,48 @@
+# src/extract_video_emb.py
+import os
+import argparse
+import numpy as np
+import torch
+from glob import glob
+from mc3_frozen import FrozenMC3
+from video_windows import read_video_cv2, sliding_windows
+
+def main(args):
+    os.makedirs(args.out_dir, exist_ok=True)
+    model = FrozenMC3(device=args.device)
+
+    mp4s = sorted(glob(os.path.join(args.vid_dir, "*.mp4")))
+    for mp4 in mp4s:
+        vid_id = os.path.splitext(os.path.basename(mp4))[0]
+        out_npy = os.path.join(args.out_dir, f"{vid_id}.npy")
+        if os.path.exists(out_npy) and not args.overwrite:
+            continue
+
+        vid, fps = read_video_cv2(mp4, target_fps=args.fps, size=args.size)
+        windows = sliding_windows(vid, win=args.win, stride=args.stride)
+        if not windows:
+            print(f"[warn] too short: {vid_id}")
+            np.save(out_npy, np.zeros((0, 512), dtype=np.float32))
+            continue
+
+        embs = []
+        for clip in windows:
+            clip = clip.unsqueeze(0).to(model.device)
+            emb = model.encode_video(clip)
+            embs.append(emb.cpu().numpy())
+
+        embs = np.concatenate(embs, axis=0)
+        np.save(out_npy, embs)
+        print(f"✓ saved {out_npy} with shape {embs.shape}")
+
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--vid_dir", default="data/ave/raw/AVE")
+    ap.add_argument("--out_dir", default="cache/vid_emb")
+    ap.add_argument("--fps", type=int, default=24)
+    ap.add_argument("--size", type=int, default=224)
+    ap.add_argument("--win", type=int, default=16)
+    ap.add_argument("--stride", type=int, default=4)
+    ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    ap.add_argument("--overwrite", action="store_true")
+    main(ap.parse_args())

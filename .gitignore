@@ -1,0 +1,51 @@
+# ---- Core data directories ----
+data/
+cache/
+reports/
+
+# ---- Virtual environment ----
+.venv/
+venv/
+ENV/
+env/
+
+# ---- Python bytecode ----
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.pkl
+
+# ---- Temporary / Logs ----
+*.log
+*.out
+*.err
+*.tmp
+*.swp
+
+# ---- OS / Editor files ----
+.DS_Store
+*.bak
+*.old
+*.orig
+*.sublime-project
+*.sublime-workspace
+
+# ---- Jupyter & VSCode ----
+.ipynb_checkpoints/
+.vscode/
+.idea/
+
+# ---- Archives ----
+*.zip
+*.tar
+*.tar.gz
+
+# ---- Torch / Model Checkpoints ----
+*.pt
+*.pth
+*.ckpt
+
+# ---- FFMPEG output or temp ----
+*.wav
+*.mp4
