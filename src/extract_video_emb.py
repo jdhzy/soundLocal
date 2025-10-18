@@ -49,7 +49,11 @@ def main(args):
             continue
 
         # read video; be compatible with either 2-tuple or 3-tuple return
-        rv = read_video_fn(mp4, target_fps=args.fps, size=args.size)
+        try:
+            rv = read_video_fn(mp4, target_fps=args.fps, size=args.size)
+        except Exception as e:
+            print(f"[warn] decord read failed for {mp4}: {e}")
+            continue
         if isinstance(rv, tuple) and len(rv) == 3:
             vid, eff_fps, T = rv
         else:
