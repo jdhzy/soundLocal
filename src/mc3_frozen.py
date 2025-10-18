@@ -4,6 +4,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torchaudio as ta
 from torchvision.models.video import mc3_18, MC3_18_Weights
+from torch.backends.cuda import is_bf16_supported
+
 
 _CHANNELS_LAST_3D = getattr(torch, "channels_last_3d", torch.channels_last)
 
@@ -22,6 +24,7 @@ class AudioProjector(nn.Module):
             nn.Linear(32 * 16 * 16, emb_dim),
             L2Norm(),
         )
+        self.param_dtype = torch.float32
 
     @torch.inference_mode()
     def forward(self, mels: torch.Tensor) -> torch.Tensor:
@@ -35,6 +38,15 @@ def _fp16_except_norms(m: nn.Module):
             mod.float()
         elif isinstance(mod, (nn.Conv1d, nn.Conv2d, nn.Conv3d, nn.Linear)):
             mod.half()
+
+'''Helper for ensure_on_device()'''
+def _fp32_module(m: torch.nn.Module):
+    for p in m.parameters(recurse=True):
+        if p.dtype.is_floating_point:
+            p.data = p.data.float()
+    for b in m.buffers(recurse=True):
+        if b.dtype.is_floating_point:
+            b.data = b.data.float()
 
 class FrozenMC3(nn.Module):
     def __init__(self, device: str | None = None, vid_emb_dim: int = 512, aud_emb_dim: int = 512):
@@ -66,21 +78,34 @@ class FrozenMC3(nn.Module):
 
         self._on_device = False
 
+
     def _ensure_on_device(self):
+        
         if self._on_device:
             return
         try:
             if self.device.type == "cuda":
                 torch.cuda.empty_cache()
-            # convert weights to mixed precision before moving
+
+            # ---- VIDEO in mixed precision (fp16), channels-last 3D ----
             _fp16_except_norms(self.vid_backbone)
-            # move modules
             self.vid_backbone.to(self.device, memory_format=_CHANNELS_LAST_3D, non_blocking=True)
             self.vid_head.to(self.device, memory_format=_CHANNELS_LAST_3D, non_blocking=True)
-            self.aud_head.to(self.device, non_blocking=True)
+
+            # ---- AUDIO in fp32 ----
+            _fp32_module(self.aud_head)
+            self.aud_head.to(self.device, dtype=torch.float32, non_blocking=True)
+
+            # mel transforms are ops with buffers; keep them fp32
+            self.melspec.to(self.device)
+            self.db.to(self.device)
+
+            # stats
             self.img_mean = self.img_mean.to(self.device, non_blocking=True)
             self.img_std  = self.img_std.to(self.device, non_blocking=True)
+
             self._on_device = True
+
         except torch.cuda.OutOfMemoryError as e:
             free, total = (torch.cuda.mem_get_info() if self.device.type == "cuda" else (0,0))
             raise RuntimeError(
@@ -138,11 +163,20 @@ class FrozenMC3(nn.Module):
         feats = self.vid_backbone.layer3(feats)
         feats = self.vid_backbone.layer4(feats)
         return feats
+    
 
     @torch.inference_mode()
-    def encode_audio(self, wav_16k: torch.Tensor) -> torch.Tensor:
-        wav = wav_16k.detach().cpu() if wav_16k.is_cuda else wav_16k
-        mels = self.db(self.melspec(wav))
-        mels = (mels - mels.mean(dim=(-2, -1), keepdim=True)) / (mels.std(dim=(-2, -1), keepdim=True) + 1e-6)
-        mels = mels.to(self.device, non_blocking=True)
-        return self.aud_head(mels)
+    def encode_audio(self, wav):
+        self._ensure_on_device()
+
+        wav = wav.to(self.device, dtype=torch.float32)           # (B, L)
+        mels = self.melspec(wav)                                 # (B, n_mels, T)
+        mels = self.db(mels)
+
+        # per-clip standardization
+        m = mels.mean(dim=(1, 2), keepdim=True)
+        s = mels.std(dim=(1, 2), keepdim=True).clamp_min(1e-6)
+        mels = (mels - m) / s                                    # (B, n_mels, T)
+
+        # DO NOT unsqueeze here (forward() already does it)
+        return self.aud_head(mels)                               # (B, 512)
