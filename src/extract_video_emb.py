@@ -103,7 +103,8 @@ def main(args):
             for i in range(0, idx.shape[0], bs):
                 batch_idx = idx[i:i+bs]
                 # stack clips to (B,C,T,H,W)
-                clips = torch.stack([vid[:, s:e] for (s, e) in batch_idx], dim=0).to(model.device)
+                # keep on CPU; encode_video() will move to GPU with autocast + channels_last
+                clips = torch.stack([vid[:, s:e] for (s, e) in batch_idx], dim=0)
                 if use_amp:
                     with torch.autocast(device_type="cuda", dtype=torch.float16):
                         emb = model.encode_video(clips)
