@@ -120,17 +120,33 @@ def main(args):
         )
         print(f"✓ saved {out_npz} emb{embs.shape} windows={len(centers_s)} fps={eff_fps:.2f}")
 
-if __name__ == "__main__":
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--vid_dir", default="data/ave/raw/AVE")
-    ap.add_argument("--out_dir", default="cache/vid_emb")
-    ap.add_argument("--fps", type=int, default=24)
-    ap.add_argument("--size", type=int, default=224)
-    ap.add_argument("--win", type=int, default=16)
-    ap.add_argument("--stride", type=int, default=4)
-    ap.add_argument("--scales", type=str, default="", help='optional multi-scale, e.g. "16:4,32:8"')
-    ap.add_argument("--batch_size", type=int, default=64)
-    ap.add_argument("--fp16", action="store_true")
-    ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
-    ap.add_argument("--overwrite", action="store_true")
-    main(ap.parse_args())
+    if __name__ == "__main__":
+        ap = argparse.ArgumentParser()
+        ap.add_argument("--vid_dir", default="data/ave/raw/AVE",
+                        help="Directory containing video files (.mp4)")
+        ap.add_argument("--out_dir", default="cache/vid_emb",
+                        help="Output directory to store cached embeddings (.npz)")
+        ap.add_argument("--fps", type=int, default=24, help="Target FPS for sampling")
+        ap.add_argument("--size", type=int, default=224, help="Frame size for resizing (square)")
+        ap.add_argument("--win", type=int, default=16, help="Temporal window size (frames)")
+        ap.add_argument("--stride", type=int, default=4, help="Stride between windows (frames)")
+        ap.add_argument("--scales", type=str, default="",
+                        help='Optional multi-scale setting, e.g. "16:4,32:8"')
+        ap.add_argument("--batch_size", type=int, default=64,
+                        help="Batch size for embedding extraction")
+        ap.add_argument("--fp16", action="store_true",
+                        help="Use automatic mixed precision (half precision)")
+        ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu",
+                        help="Device to use: cuda or cpu")
+        ap.add_argument("--overwrite", action="store_true",
+                        help="Overwrite existing embedding files")
+        ap.add_argument("--backend", choices=["cv2", "decord"], default="cv2",
+                        help="Video decoding backend (default=cv2)")
+
+        args = ap.parse_args()
+
+        # Optional: print summary of config
+        print(f"→ Using backend: {args.backend}, device: {args.device}, "
+            f"batch={args.batch_size}, win={args.win}, stride={args.stride}")
+
+        main(args)
