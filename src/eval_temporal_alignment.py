@@ -127,14 +127,36 @@ def plot_curve(out_png, t_vid, sim, pdf, pred_t, gt_start, gt_end, title):
 def main(args):
     os.makedirs(args.curve_dir, exist_ok=True)
 
-    # Build GT map
-    ann_map = load_annotation_map(args.annotations_csv)
+    # --- Load GT spans and labels from AVE annotations ---
+    # Expect a CSV with columns like: video_id,event_label,start_s,end_s,split
+    ann_df = pd.read_csv(args.annotations_csv)
+    # Normalize id key from the annotations
+    if "video_id" not in ann_df.columns:
+        # fallbacks: yt_id or first column
+        if "yt_id" in ann_df.columns:
+            ann_df = ann_df.rename(columns={"yt_id": "video_id"})
+        else:
+            ann_df = ann_df.rename(columns={ann_df.columns[0]: "video_id"})
+    # Build GT span and label maps (take first label if multiple rows per id)
+    gt_map = {}
+    label_map = {}
+    for vid, sub in ann_df.groupby("video_id"):
+        # prefer explicit start/end columns; fallbacks to 'start_s'/'end_s'
+        if {"start_s","end_s"}.issubset(sub.columns):
+            s, e = float(sub["start_s"].iloc[0]), float(sub["end_s"].iloc[0])
+        elif {"gt_start","gt_end"}.issubset(sub.columns):
+            s, e = float(sub["gt_start"].iloc[0]), float(sub["gt_end"].iloc[0])
+        else:
+            # If no segment, assume whole 10s clip (AVE default)
+            s, e = 0.0, 10.0
+        gt_map[extract_youtube_id(vid)] = (s, e)
+        if "event_label" in sub.columns:
+            label_map[extract_youtube_id(vid)] = str(sub["event_label"].iloc[0])
 
-    # Index available videos and audios
+    # --- Index available embeddings ---
     vid_npzs = sorted(glob(os.path.join(args.vid_emb_dir, "*.npz")))
     aud_npzs = sorted(glob(os.path.join(args.aud_emb_dir, f"*__L{int(args.L_sec*1000)}ms.npz")))
 
-    # Map by YT id
     vids = {extract_youtube_id(os.path.splitext(os.path.basename(p))[0]): p for p in vid_npzs}
     auds = {}
     for p in aud_npzs:
@@ -142,7 +164,7 @@ def main(args):
         vid = stem.split("__L")[0]
         auds[extract_youtube_id(vid)] = p
 
-    keys = sorted(set(vids.keys()) & set(auds.keys()) & set(ann_map.keys()))
+    keys = sorted(set(vids.keys()) & set(auds.keys()) & set(gt_map.keys()))
     if len(keys) == 0:
         print("[warn] No overlapping keys between embeddings and annotations. Check paths.")
         print(f"vid dir: {args.vid_emb_dir}")
@@ -154,6 +176,7 @@ def main(args):
 
     rows = []
     n_plotted = 0
+
     for k in tqdm(keys, desc="Evaluate", unit="clip"):
         vnpz = np.load(vids[k])
         anpz = np.load(auds[k])
@@ -165,49 +188,74 @@ def main(args):
         if a_vec is None or V.shape[0] == 0:
             continue
 
-        sim = cosine_sim(a_vec, V)          # (Tv,)
-        pdf = softmax(sim, tau=args.tau)    # (Tv,)
-        pred_idx = int(np.argmax(pdf))
-        pred_t = float(t_vid[pred_idx])
+        # --- similarity + PDF ---
+        sim = cosine_sim(a_vec, V)                   # (Tv,)
+        z = sim / float(args.tau)
+        z = z - z.max()                              # numerical stability
+        p = np.exp(z)
+        p = p / (p.sum() + 1e-12)                    # PDF over time
 
-        gt_start, gt_end = ann_map[k]
+        pred_idx = int(np.argmax(p))
+        pred_t = float(t_vid[pred_idx])
+        confidence = float(p[pred_idx])
+        entropy = float(-(p * (np.log(p + 1e-12))).sum())  # natural-log entropy
+
+        # --- eval vs GT ---
+        gt_start, gt_end = gt_map[k]
         metrics = evaluate_hit(pred_t, gt_start, gt_end, deltas=tuple(args.hit_deltas))
+
+        # --- assemble canonical row ---
         row = {
-            "yt_id": k,
-            "pred_t": pred_t,
-            "gt_start": gt_start,
-            "gt_end": gt_end,
+            "video_id": k,                    # canonical id key
+            "t_pred_sec": pred_t,             # canonical pred time
+            "gt_start_sec": gt_start,         # canonical gt start
+            "gt_end_sec": gt_end,             # canonical gt end
+            "gt_mid_sec": (gt_start + gt_end) / 2.0,
             "audio_center": float(a_center),
-            "tau": args.tau,
-            "L_sec": args.L_sec,
-            **metrics,
+            "tau": float(args.tau),
+            "L_sec": float(args.L_sec),
+            "confidence": confidence,         # NEW
+            "entropy": entropy,               # NEW
+            # expand hit metrics to canonical names the analyzer expects
+            "hit_0.25": metrics.get("hit@0.25", 0.0),
+            "hit_0.5":  metrics.get("hit@0.5",  0.0),
+            "hit_1.0":  metrics.get("hit@1.0",  0.0),
+            "mae":      metrics.get("mae_mid", abs(pred_t - (gt_start+gt_end)/2.0)),
+            "inside":   metrics.get("inside", float(gt_start <= pred_t <= gt_end)),
         }
+        # optional label
+        if k in label_map:
+            row["event_label"] = label_map[k]
+
         rows.append(row)
 
-        # Optional plot a few examples
+        # --- optional plots ---
         if n_plotted < args.plot_n:
-            title = f"{k} | pred={pred_t:.2f}s | GT=[{gt_start:.2f},{gt_end:.2f}]"
+            title = f"{k} | pred={pred_t:.2f}s | GT=[{gt_start:.2f},{gt_end:.2f}] | conf={confidence:.2f}"
             out_png = os.path.join(args.curve_dir, f"{k}.png")
-            plot_curve(out_png, t_vid, sim, pdf, pred_t, gt_start, gt_end, title)
+            plot_curve(out_png, t_vid, sim, p, pred_t, gt_start, gt_end, title)
             n_plotted += 1
 
-    # Save summary
+    # --- Save summary ---
     if len(rows) > 0:
         df = pd.DataFrame(rows)
         os.makedirs(os.path.dirname(args.summary_csv), exist_ok=True)
         df.to_csv(args.summary_csv, index=False)
-        # Print aggregate metrics
+
+        # quick print aggregate
         agg = {
             "N": len(df),
-            "Hit@0.25": float(df["hit@0.25"].mean()),
-            "Hit@0.5": float(df["hit@0.5"].mean()),
-            "Hit@1.0": float(df["hit@1.0"].mean()),
-            "Inside": float(df["inside"].mean()),
-            "MAE_mid": float(df["mae_mid"].mean()),
+            "MAE_mean": float(df["mae"].mean()),
+            "Inside_mean": float(df["inside"].mean()),
+            "Hit@0.25": float(df["hit_0.25"].mean()),
+            "Hit@0.5":  float(df["hit_0.5"].mean()),
+            "Hit@1.0":  float(df["hit_1.0"].mean()),
+            "Conf_mean": float(df["confidence"].mean()),
+            "Ent_mean":  float(df["entropy"].mean()),
         }
         print("→ Summary:", agg)
     else:
-        print("[warn] No rows evaluated. Did keys match?")
+        print("[warn] No rows evaluated. Did keys match?)")
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
