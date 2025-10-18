@@ -14,6 +14,8 @@ import torchaudio as ta
 from glob import glob
 from typing import Tuple, List
 from mc3_frozen import FrozenMC3
+from tqdm import tqdm
+import tempfile, os
 
 def load_wav_mono_16k(path: str) -> Tuple[torch.Tensor, int]:
     wav, sr = ta.load(path)          # (C, T)
@@ -71,56 +73,115 @@ def parse_lengths(s: str) -> List[float]:
 
 def main(args):
     os.makedirs(args.out_dir, exist_ok=True)
-    device = args.device if args.device in ("cpu","cuda") else ("cuda" if torch.cuda.is_available() else "cpu")
+    device = args.device if args.device in ("cpu", "cuda") else ("cuda" if torch.cuda.is_available() else "cpu")
     model = FrozenMC3(device=device)
 
     lengths = parse_lengths(args.lengths)
     wavs = sorted(glob(os.path.join(args.wav_dir, "*.wav")))
-    if len(wavs) == 0:
+    if not wavs:
         print(f"[warn] no wav files found in {args.wav_dir}")
         return
 
-    for w in wavs:
+    # For progress: count how many already done for the first length
+    first_len_ms = int(round(lengths[0] * 1000))
+    already = sum(
+        os.path.exists(os.path.join(args.out_dir, f"{os.path.splitext(os.path.basename(w))[0]}__L{first_len_ms}ms.npz"))
+        for w in wavs
+    )
+
+    pbar = tqdm(wavs, desc="Audio embeddings", unit="wav", initial=already, total=len(wavs))
+    file_times = []
+    start_all = time.time()
+
+    for w in pbar:
+        t0 = time.time()
         vid_id = os.path.splitext(os.path.basename(w))[0]
-        wav, sr = load_wav_mono_16k(w)            # (1,T), 16k
-        T = wav.shape[-1]
-        wav = wav.to(model.device)
 
-        for L_sec in lengths:
-            tag_ms = int(round(L_sec * 1000))
-            out_npz = os.path.join(args.out_dir, f"{vid_id}__L{tag_ms}ms.npz")
-            if os.path.exists(out_npz) and not args.overwrite:
-                continue
+        try:
+            wav, sr = load_wav_mono_16k(w)  # (1, T)
+            T = wav.shape[-1]
+            wav = wav.to(model.device)
 
-            idx, centers_s = crop_indices(T, sr, L_sec=L_sec, stride_sec=args.stride_sec)
-            if idx.shape[0] == 0:
-                np.savez_compressed(out_npz, emb=np.zeros((0,512), np.float32),
-                                    centers_sec=np.zeros((0,), np.float32),
-                                    L_sec=float(L_sec), stride_sec=float(args.stride_sec), sr=sr)
-                print(f"[warn] no crops for {vid_id} L={L_sec}s")
-                continue
+            any_saved = False
+            for L_sec in lengths:
+                tag_ms = int(round(L_sec * 1000))
+                out_npz = os.path.join(args.out_dir, f"{vid_id}__L{tag_ms}ms.npz")
 
-            crops = get_crops(wav, sr, idx, L_sec=L_sec)  # (K, L)
-            # Encode in small batches to save memory
-            K = crops.shape[0]
-            bs = args.batch_size
-            embs = []
-            with torch.inference_mode():
-                for i in range(0, K, bs):
-                    seg = crops[i:i+bs].to(model.device)       # (B, L)
-                    emb = model.encode_audio(seg)              # (B, D)
-                    embs.append(emb.cpu().numpy())
-            embs = np.concatenate(embs, axis=0).astype(np.float32)  # (K, D)
+                # Resume: skip if already computed (unless --overwrite)
+                if os.path.exists(out_npz) and not args.overwrite:
+                    continue
 
-            np.savez_compressed(
-                out_npz,
-                emb=embs,
-                centers_sec=centers_s.astype(np.float32),
-                L_sec=float(L_sec),
-                stride_sec=float(args.stride_sec),
-                sr=int(sr)
-            )
-            print(f"✓ saved {out_npz} emb{embs.shape} crops={K} L={L_sec}s stride={args.stride_sec}s")
+                # Crop plan for this (wav, length)
+                idx, centers_s = crop_indices(T, sr, L_sec=L_sec, stride_sec=args.stride_sec)
+                if idx.shape[0] == 0:
+                    # Atomic empty save
+                    fd, tmp_path = tempfile.mkstemp(dir=args.out_dir, suffix=".tmp")
+                    os.close(fd)
+                    np.savez_compressed(
+                        tmp_path,
+                        emb=np.zeros((0, 512), np.float32),
+                        centers_sec=np.zeros((0,), np.float32),
+                        L_sec=float(L_sec),
+                        stride_sec=float(args.stride_sec),
+                        sr=int(sr),
+                    )
+                    os.replace(tmp_path, out_npz)
+                    tqdm.write(f"[warn] no crops for {vid_id} L={L_sec}s")
+                    any_saved = True
+                    continue
+
+                # Build crops (K, L)
+                crops = get_crops(wav, sr, idx, L_sec=L_sec)
+                K, bs = crops.shape[0], args.batch_size
+                embs = []
+
+                with torch.inference_mode():
+                    for i in range(0, K, bs):
+                        seg = crops[i:i + bs].to(model.device, non_blocking=True)  # (B, L)
+                        emb = model.encode_audio(seg)                               # (B, D)
+                        embs.append(emb.float().cpu().numpy())
+
+                        # light heartbeat every ~20 batches if many crops
+                        if K >= 400 and (i // bs) % 20 == 0 and i + bs < K:
+                            tqdm.write(f"{vid_id} L={L_sec}s: {i + bs}/{K} crops")
+
+                embs = np.concatenate(embs, axis=0).astype(np.float32)  # (K, D)
+
+                # Atomic save
+                fd, tmp_path = tempfile.mkstemp(dir=args.out_dir, suffix=".tmp")
+                os.close(fd)
+                np.savez_compressed(
+                    tmp_path,
+                    emb=embs,
+                    centers_sec=centers_s.astype(np.float32),
+                    L_sec=float(L_sec),
+                    stride_sec=float(args.stride_sec),
+                    sr=int(sr),
+                )
+                os.replace(tmp_path, out_npz)
+                any_saved = True
+                tqdm.write(f"✓ {vid_id} L={L_sec}s emb{embs.shape} crops={K} stride={args.stride_sec}s")
+
+            # Update pbar if this file is fully handled (either saved or already present for all lengths)
+            if any_saved or all(
+                os.path.exists(os.path.join(args.out_dir, f"{vid_id}__L{int(round(L * 1000))}ms.npz"))
+                for L in lengths
+            ):
+                dt = time.time() - t0
+                file_times.append(dt)
+                if len(file_times) > 100:  # smooth ETA
+                    file_times.pop(0)
+                avg = sum(file_times) / max(1, len(file_times))
+                remaining = (pbar.total - (pbar.n + 1)) * avg
+                pbar.set_postfix(time_per="{:.2f}s".format(dt), eta="{:.1f}m".format(remaining / 60.0))
+                pbar.update(1)
+
+        except Exception as e:
+            tqdm.write(f"[error] {w}: {e}")
+            # continue to next file without killing the run
+
+    total_min = (time.time() - start_all) / 60.0
+    print(f"Done. Total time: {total_min:.1f} min")
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
