@@ -4,7 +4,20 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torchaudio as ta
 from torchvision.models.video import mc3_18, MC3_18_Weights
-from torch.backends.cuda import is_bf16_supported
+
+try:
+    _is_bf16_supported = torch.cuda.is_bf16_supported  # PyTorch ≥ 2.1
+except AttributeError:
+    def _is_bf16_supported():
+        # Fallback if API not present
+        try:
+            # Some builds have torch.backends.cuda.matmul.allow_bf16 or similar;
+            # we’ll just return False as a safe default.
+            return False
+        except Exception:
+            return False
+        
+#------------------------------
 
 
 _CHANNELS_LAST_3D = getattr(torch, "channels_last_3d", torch.channels_last)
