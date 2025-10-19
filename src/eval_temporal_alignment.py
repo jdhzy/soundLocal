@@ -331,14 +331,14 @@ def main(args):
         print(f"vid dir: {args.vid_emb_dir}")
         print(f"aud dir: {args.aud_emb_dir}")
         print(f"ann csv: {args.annotations_csv}")
-        return
+        raise SystemExit
 
     print(f"→ Evaluating {len(keys)} clips | τ={args.tau} | L={args.L_sec}s | audio_pick={args.audio_pick}")
 
-    # Parse multi-audio offsets (seconds) if requested
-    offsets = []
-    if getattr(args, "audio_pick", "middle") == "multi":
-        offsets = [float(x) for x in args.multi_offsets.split(",") if x.strip()]
+    # Parse multi-audio relative offsets (seconds) once (used only if audio_pick=multi)
+    rel_offsets = []
+    if args.audio_pick == "multi":
+        rel_offsets = [float(x) for x in args.multi_offsets.split(",") if x.strip()]
 
     rows, n_plotted = [], 0
 
@@ -346,25 +346,18 @@ def main(args):
         vnpz = np.load(vids[k])
         anpz = np.load(auds[k])
 
-        centers = anpz["centers_sec"].astype(np.float32)
-
-        if args.audio_pick == "multi":
-            rel = [float(x) for x in args.multi_offsets.split(",") if x.strip()]
-            base = float(np.median(centers))  # middle of clip in seconds
-            offsets = [base + r for r in rel]  # convert relative → absolute
-            a_list, a_center = pick_audio_multi(anpz, offsets=offsets, reduce=args.multi_reduce)
-        else:
-            a_vec, a_center = pick_audio_single(anpz, mode="middle")
-            a_list = [a_vec] if a_vec is not None else []
-
-        V = vnpz["emb"].astype(np.float32)          # (Tv, D)
-        t_vid = vnpz["centers_sec"].astype(np.float32)  # (Tv,)
+        V = vnpz["emb"].astype(np.float32)                # (Tv, D)
+        t_vid = vnpz["centers_sec"].astype(np.float32)    # (Tv,)
         if V.shape[0] == 0:
             continue
 
         # --- choose audio query (single or multi) ---
-        if getattr(args, "audio_pick", "middle") == "multi":
-            a_list, a_center = pick_audio_multi(anpz, offsets=offsets, reduce=getattr(args, "multi_reduce", "mean"))
+        if args.audio_pick == "multi":
+            centers = anpz["centers_sec"].astype(np.float32)
+            base = float(np.median(centers)) if centers.size > 0 else 5.0
+            abs_offsets = [base + r for r in rel_offsets]  # relative -> absolute
+            a_list, a_center = pick_audio_multi(anpz, offsets=abs_offsets, reduce=args.multi_reduce)
+            # a_list: list of (D,) vectors; a_center: float (mean of chosen centers)
         else:
             a_vec, a_center = pick_audio_single(anpz, mode="middle")
             a_list = [a_vec] if a_vec is not None else []
@@ -372,18 +365,18 @@ def main(args):
         if len(a_list) == 0:
             continue
 
-        # --- similarity → PDF (per-audio) → fuse ---
+        # --- similarity → PDF (per-crop) → fuse ---
         pdfs, sims_for_plot = [], []
         for a_vec in a_list:
             if a_vec is None:
                 continue
             sim = cosine_sim(a_vec, V)  # (Tv,)
-            if getattr(args, "score_zscore", False):
+            if args.score_zscore:
                 sim = zscore(sim)
-            if getattr(args, "score_smooth_sigma", 0.0) > 0:
+            if args.score_smooth_sigma > 0:
                 sim = gaussian_smooth(sim, sigma=args.score_smooth_sigma)
 
-            tau_use = adapt_tau(sim, target_H=args.tau_adapt) if getattr(args, "tau_adapt", 0.0) > 0 else args.tau
+            tau_use = adapt_tau(sim, target_H=args.tau_adapt) if args.tau_adapt > 0 else args.tau
             p = softmax(sim, tau=tau_use)
 
             sims_for_plot.append(sim)
@@ -393,16 +386,11 @@ def main(args):
             continue
 
         pdfs = np.stack(pdfs, 0)  # (K, Tv)
-        if getattr(args, "multi_reduce", "mean") == "max":
-            p_fused = pdfs.max(axis=0)
-        else:
-            p_fused = pdfs.mean(axis=0)
-
-        # fused similarity for plotting (mean of sims)
+        p_fused = pdfs.max(axis=0) if args.multi_reduce == "max" else pdfs.mean(axis=0)
         sim_plot = np.stack(sims_for_plot, 0).mean(axis=0) if len(sims_for_plot) else p_fused
 
         # prediction (hard or soft)
-        if getattr(args, "pred_softargmax", False):
+        if args.pred_softargmax:
             pred_t = soft_argmax(t_vid, p_fused)
             pred_idx = int(np.argmax(p_fused))
         else:
@@ -425,8 +413,8 @@ def main(args):
             "gt_end_sec": gt_end,
             "gt_mid_sec": (gt_start + gt_end) / 2.0,
             "audio_center": float(a_center) if a_center is not None else float("nan"),
-            "tau": (float(args.tau) if getattr(args, "tau_adapt", 0.0) <= 0 else float("nan")),
-            "tau_adapt": float(getattr(args, "tau_adapt", 0.0)),
+            "tau": (float(args.tau) if args.tau_adapt <= 0 else float("nan")),
+            "tau_adapt": float(args.tau_adapt),
             "L_sec": float(args.L_sec),
             "confidence": confidence,
             "entropy": ent,
@@ -435,7 +423,7 @@ def main(args):
             "hit_1.0":  metrics.get("hit@1.0",  0.0),
             "mae":      metrics.get("mae_mid", abs(pred_t - (gt_start + gt_end)/2.0)),
             "inside":   metrics.get("inside", float(gt_start <= pred_t <= gt_end)),
-            # legacy names (kept for your analyzer compatibility)
+            # legacy names (kept for analyzer compatibility)
             "yt_id": k,
             "pred_t": pred_t,
             "gt_start": gt_start,
@@ -498,6 +486,12 @@ def main(args):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
+    ap.add_argument("--log_sim_stats", action="store_true",
+                help="Write per-clip similarity diagnostics to CSV")
+    ap.add_argument("--sim_log_csv", default="reports/sim_stats.csv",
+                    help="Path to write similarity diagnostics CSV")
+    ap.add_argument("--print_sim_every", type=int, default=0,
+                    help="If >0, print a sample of similarity stats every N clips")
 
     # I/O
     ap.add_argument("--vid_emb_dir", default="cache/vid_emb")
