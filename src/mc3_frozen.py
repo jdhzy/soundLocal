@@ -103,7 +103,10 @@ class FrozenMC3(nn.Module):
             # ---- VIDEO in mixed precision (fp16), channels-last 3D ----
             _fp16_except_norms(self.vid_backbone)
             self.vid_backbone.to(self.device, memory_format=_CHANNELS_LAST_3D, non_blocking=True)
-            self.vid_head.to(self.device, memory_format=_CHANNELS_LAST_3D, non_blocking=True)
+
+            # Make vid_head match backbone dtype + device
+            bb_dtype = next(self.vid_backbone.parameters()).dtype
+            self.vid_head.to(self.device, dtype=bb_dtype, memory_format=_CHANNELS_LAST_3D, non_blocking=True)
 
             # ---- AUDIO in fp32 ----
             _fp32_module(self.aud_head)
@@ -144,29 +147,28 @@ class FrozenMC3(nn.Module):
 
     @torch.inference_mode()
     def encode_video(self, clip: torch.Tensor) -> torch.Tensor:
+        """clip: (B,C,T,H,W) or (B,T,C,H,W) in [0,1] or uint8."""
         self._ensure_on_device()
 
+        # to 5D (B,C,T,H,W) and scale uint8→float in [0,1]
         x = self._to_5d_chw(self._maybe_scale_uint(clip))
-        # Move to GPU first
         x = x.to(self.device, memory_format=_CHANNELS_LAST_3D, non_blocking=True)
 
-        use_amp = (self.device.type == "cuda")
-        if use_amp:
-            with torch.autocast(device_type="cuda", dtype=torch.float16):
-                # match dtype so broadcasting is safe under AMP
-                mean = self.img_mean.to(x.dtype)
-                std  = (self.img_std.to(x.dtype) + 1e-8)
-                x = (x - mean) / std
+        # Match backbone dtype explicitly (don’t rely on autocast here)
+        x = x.to(self._bb_dtype)
+        mean = self.img_mean.to(self._bb_dtype)
+        std  = (self.img_std.to(self._bb_dtype) + 1e-8)
+        x = (x - mean) / std
 
-                feats = self._forward_backbone(x)
-        else:
-            mean = self.img_mean.to(x.dtype)
-            std  = (self.img_std.to(x.dtype) + 1e-8)
-            x = (x - mean) / std
+        # Forward backbone → feats
+        feats = self._forward_backbone(x)  # respects channels-last 3D
 
-            feats = self._forward_backbone(x)
+        # Ensure head sees the same dtype as its weights
+        head_dtype = next(self.vid_head.parameters()).dtype
+        if feats.dtype != head_dtype:
+            feats = feats.to(head_dtype)
 
-        out = self.vid_head(feats)
+        out = self.vid_head(feats)         # (B, 512) then L2Norm inside head
         return out
 
     def _forward_backbone(self, x: torch.Tensor) -> torch.Tensor:
