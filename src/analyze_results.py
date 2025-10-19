@@ -188,7 +188,23 @@ def per_class_table(df: pd.DataFrame, out_dir: str):
     print("✓ per_class_metrics.csv")
 
 
+import datetime
+
+
 def main(args):
+    base_is_analysis = args.out_dir == "reports/analysis" or args.out_dir.endswith("/analysis")
+
+    if base_is_analysis:
+        # use tag if provided, otherwise fallback to timestamp
+        if args.run_tag:
+            folder = args.run_tag
+        else:
+            folder = datetime.datetime.now().strftime("run_%Y-%m-%d_%H-%M-%S")
+        args.out_dir = os.path.join(args.out_dir, folder)
+
+    os.makedirs(args.out_dir, exist_ok=True)
+    print(f"→ Analysis outputs will be saved to: {args.out_dir}")
+
     df = pd.read_csv(args.summary_csv)
     print("Columns (raw):", list(df.columns))
 
@@ -229,5 +245,6 @@ if __name__ == "__main__":
     ap.add_argument("--out_dir", default="reports/analysis")
     ap.add_argument("--bins", type=int, default=10)
     ap.add_argument("--hist_bins", type=int, default=40)
+    ap.add_argument("--run_tag", default="", help="Optional name for this run (e.g., 'tau007_multi').")
     args = ap.parse_args()
     main(args)
