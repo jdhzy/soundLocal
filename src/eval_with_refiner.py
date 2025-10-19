@@ -157,10 +157,64 @@ def main():
     os.makedirs(args.curve_dir, exist_ok=True)
 
     # load model
-    ckpt = torch.load(args.refiner_ckpt, map_location=args.device)
-    D = int(ckpt.get("D", args.grid_D))
+    # --- load model safely ---
+    import torch.nn as nn
+
+    def _load_refiner_checkpoint(path, device, model: nn.Module):
+        # Try safe load first (suppresses the FutureWarning)
+        try:
+            ckpt = torch.load(path, map_location=device, weights_only=True)
+        except TypeError:
+            ckpt = torch.load(path, map_location=device)
+
+        # Normalize to a state_dict format
+        state_dict = None
+        if isinstance(ckpt, nn.Module):
+            state_dict = ckpt.state_dict()
+        elif isinstance(ckpt, dict):
+            if "state_dict" in ckpt and isinstance(ckpt["state_dict"], dict):
+                state_dict = ckpt["state_dict"]
+            elif "model_state_dict" in ckpt and isinstance(ckpt["model_state_dict"], dict):
+                state_dict = ckpt["model_state_dict"]
+            else:
+                if all(isinstance(k, str) for k in ckpt.keys()):
+                    state_dict = ckpt
+
+        # fallback for non-standard saves
+        if state_dict is None:
+            ckpt = torch.load(path, map_location=device, weights_only=False)
+            if isinstance(ckpt, nn.Module):
+                state_dict = ckpt.state_dict()
+            elif isinstance(ckpt, dict):
+                state_dict = ckpt.get("state_dict") or ckpt.get("model_state_dict") or (
+                    ckpt if all(isinstance(k, str) for k in ckpt.keys()) else None
+                )
+
+        if state_dict is None:
+            raise RuntimeError(f"Unrecognized checkpoint format at {path}")
+
+        missing, unexpected = model.load_state_dict(state_dict, strict=False)
+        if missing or unexpected:
+            print(f"⚠️  load_state_dict(strict=False): missing={len(missing)} unexpected={len(unexpected)}")
+            for k in missing[:5]: print("   missing:", k)
+            for k in unexpected[:5]: print("   unexpected:", k)
+
+        return model
+
+
+    # --- instantiate and load ---
+    print(f"Loading refiner checkpoint from {args.refiner_ckpt} ...")
+
+    # Build model — if checkpoint has D, use it; else fall back to args.grid_D
+    try:
+        ckpt = torch.load(args.refiner_ckpt, map_location=args.device)
+        D = int(ckpt.get("D", args.grid_D)) if isinstance(ckpt, dict) else args.grid_D
+    except Exception:
+        D = args.grid_D
+
     model = Refiner(D=D).to(args.device).float().eval()
-    model.load_state_dict(ckpt["state_dict"])
+    model = _load_refiner_checkpoint(args.refiner_ckpt, args.device, model)
+    print(f"✓ Loaded refiner from {args.refiner_ckpt}")
 
     # index files
     vid_npzs = sorted(glob(os.path.join(args.vid_emb_dir, "*.npz")))
