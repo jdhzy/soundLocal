@@ -152,6 +152,10 @@ def main():
 
     ap.add_argument("--hit_deltas", type=float, nargs="+", default=[0.25, 0.5, 1.0])
     ap.add_argument("--plot_n", type=int, default=0)
+
+    ap.add_argument("--pred_softargmax", action="store_true",
+                help="use soft-argmax for prediction instead of hard argmax")
+    
     args = ap.parse_args()
 
     os.makedirs(args.curve_dir, exist_ok=True)
