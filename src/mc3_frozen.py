@@ -92,43 +92,62 @@ class FrozenMC3(nn.Module):
         self._on_device = False
 
 
-    def _ensure_on_device(self):
-        
-        if self._on_device:
-            return
-        try:
-            if self.device.type == "cuda":
-                torch.cuda.empty_cache()
+def _ensure_on_device(self):
+    """Move modules to device and align dtypes (video: fp16, audio: fp32)."""
+    if getattr(self, "_on_device", False):
+        return
 
-            # ---- VIDEO in mixed precision (fp16), channels-last 3D ----
-            _fp16_except_norms(self.vid_backbone)
-            self.vid_backbone.to(self.device, memory_format=_CHANNELS_LAST_3D, non_blocking=True)
+    if self.device.type == "cuda":
+        torch.cuda.empty_cache()
 
-            # Make vid_head match backbone dtype + device
-            bb_dtype = next(self.vid_backbone.parameters()).dtype
-            self.vid_head.to(self.device, dtype=bb_dtype, memory_format=_CHANNELS_LAST_3D, non_blocking=True)
+    # VIDEO: backbone uses fp16 (mixed precision)
+    _fp16_except_norms(self.vid_backbone)
+    self.vid_backbone.to(self.device, memory_format=_CHANNELS_LAST_3D, non_blocking=True)
 
-            # ---- AUDIO in fp32 ----
-            _fp32_module(self.aud_head)
-            self.aud_head.to(self.device, dtype=torch.float32, non_blocking=True)
+    # Make video head dtype match backbone
+    bb_dtype = next(self.vid_backbone.parameters()).dtype  # should be float16
+    self.vid_head.to(self.device, dtype=bb_dtype, memory_format=_CHANNELS_LAST_3D, non_blocking=True)
+    self._bb_dtype = bb_dtype  # ✅ store for later
 
-            # mel transforms are ops with buffers; keep them fp32
-            self.melspec.to(self.device)
-            self.db.to(self.device)
+    # AUDIO: keep projector fp32
+    _fp32_module(self.aud_head)
+    self.aud_head.to(self.device, dtype=torch.float32, non_blocking=True)
+    self.melspec.to(self.device)
+    self.db.to(self.device)
 
-            # stats
-            self.img_mean = self.img_mean.to(self.device, non_blocking=True)
-            self.img_std  = self.img_std.to(self.device, non_blocking=True)
+    # stats → device
+    self.img_mean = self.img_mean.to(self.device, non_blocking=True)
+    self.img_std  = self.img_std.to(self.device, non_blocking=True)
 
-            self._on_device = True
+    self._on_device = True
 
-        except torch.cuda.OutOfMemoryError as e:
-            free, total = (torch.cuda.mem_get_info() if self.device.type == "cuda" else (0,0))
-            raise RuntimeError(
-                f"OOM moving MC3 to {self.device}. Free/Total={free/1e9:.2f}/{total/1e9:.2f} GB. "
-                f"Try lower --batch_size/--size/--win and set "
-                f"PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,max_split_size_mb:128"
-            ) from e
+
+    def encode_video(self, clip: torch.Tensor) -> torch.Tensor:
+        """clip: (B,C,T,H,W) or (B,T,C,H,W) in [0,1] or uint8."""
+        # Make sure model and dtype info are ready
+        self._ensure_on_device()
+        bb_dtype = getattr(self, "_bb_dtype", torch.float16 if self.device.type == "cuda" else torch.float32)
+
+        # To 5D float tensor in [0,1]
+        x = self._to_5d_chw(self._maybe_scale_uint(clip))
+        x = x.to(self.device, memory_format=_CHANNELS_LAST_3D, non_blocking=True)
+        x = x.to(bb_dtype)
+
+        # Normalize
+        mean = self.img_mean.to(bb_dtype)
+        std  = (self.img_std.to(bb_dtype) + 1e-8)
+        x = (x - mean) / std
+
+        # Backbone forward
+        feats = self._forward_backbone(x)
+
+        # Match head dtype
+        head_dtype = next(self.vid_head.parameters()).dtype
+        if feats.dtype != head_dtype:
+            feats = feats.to(head_dtype)
+
+        out = self.vid_head(feats)  # (B, 512)
+        return out
 
     @staticmethod
     def _to_5d_chw(video: torch.Tensor) -> torch.Tensor:
