@@ -215,6 +215,13 @@ def main():
 
     # Build dataset
     X, Y = [], []
+    # ---- optional: skip training if checkpoint already exists ----
+    ckpt_path = os.path.join(args.out_dir, "refiner.pt")
+    if os.path.exists(ckpt_path):
+        print(f"⚠️  Found existing checkpoint at {ckpt_path}. Skipping retraining.")
+        print("   (Delete the file manually if you want to retrain.)")
+        return
+    
     print(f"Building dataset from {len(keys)} clips...")
     for k in tqdm(keys):
         v_npz = np.load(vids[k])
