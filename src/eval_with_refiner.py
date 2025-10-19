@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-
 import os, argparse, json
 from glob import glob
 from typing import List, Tuple
@@ -8,10 +7,48 @@ from typing import List, Tuple
 import numpy as np
 import pandas as pd
 import torch
+import torch.nn as nn
 from tqdm import tqdm
 
-# ---------- same utilities as trainer ----------
+# ------------------ headless-safe plotting ------------------
+HAVE_PLT = False
+try:
+    import matplotlib  # noqa
+    if "MPLBACKEND" not in os.environ:
+        import matplotlib as _mpl  # noqa
+        _mpl.use("Agg")
+    import matplotlib.pyplot as plt  # noqa
+    HAVE_PLT = True
+except Exception:
+    HAVE_PLT = False
 
+def _ensure_dir(p: str):
+    os.makedirs(p, exist_ok=True)
+
+def plot_curve_dual(path, t, sim, p_base, p_ref, pred_base_t, pred_ref_t, gt_s, gt_e, title=""):
+    if not HAVE_PLT:
+        return
+    fig, ax1 = plt.subplots(figsize=(8, 3))
+    ax1.plot(t, sim, lw=1.0, alpha=0.7, label="similarity", color="C0")
+    ax2 = ax1.twinx()
+    ax2.plot(t, p_base, lw=1.2, alpha=0.95, label="pdf (base)", color="C1")
+    ax2.plot(t, p_ref,  lw=1.2, alpha=0.95, label="pdf (refined)", color="C2")
+
+    ax2.axvline(pred_base_t, color="C1", ls="--", lw=1, alpha=0.9)
+    ax2.axvline(pred_ref_t,  color="C2", ls="--", lw=1, alpha=0.9)
+    ax1.axvspan(gt_s, gt_e, color="k", alpha=0.08, label="GT span")
+
+    ax1.set_xlabel("time (s)"); ax1.set_ylabel("cos sim"); ax2.set_ylabel("probability")
+    ax1.set_title(title)
+    h1, l1 = ax1.get_legend_handles_labels()
+    h2, l2 = ax2.get_legend_handles_labels()
+    ax1.legend(h1 + h2, l1 + l2, loc="upper right", fontsize=8)
+    fig.tight_layout()
+    _ensure_dir(os.path.dirname(path))
+    plt.savefig(path, dpi=140, bbox_inches="tight")
+    plt.close()
+
+# ------------------ numerics/helpers ------------------
 def l2normalize(x: np.ndarray, axis=-1, eps=1e-8):
     n = np.linalg.norm(x, axis=axis, keepdims=True) + eps
     return x / n
@@ -46,6 +83,11 @@ def entropy(p: np.ndarray) -> float:
     p = np.clip(p.astype(np.float32), 1e-12, 1.0)
     return float(-(p * np.log(p)).sum())
 
+def soft_argmax(t: np.ndarray, p: np.ndarray) -> float:
+    p = np.clip(p.astype(np.float32), 1e-12, 1.0)
+    p = p / p.sum()
+    return float((t * p).sum())
+
 def adapt_tau(sim: np.ndarray, target_H: float, tol=1e-3, maxit=20) -> float:
     lo, hi = 1e-3, 10.0
     for _ in range(maxit):
@@ -59,28 +101,7 @@ def adapt_tau(sim: np.ndarray, target_H: float, tol=1e-3, maxit=20) -> float:
             break
     return float(0.5 * (lo + hi))
 
-def pick_audio_single(a_npz) -> Tuple[np.ndarray, float]:
-    A = a_npz["emb"].astype(np.float32)
-    centers = a_npz["centers_sec"].astype(np.float32)
-    if A.shape[0] == 0:
-        return None, None
-    mid = float(np.median(centers))
-    idx = int(np.argmin(np.abs(centers - mid)))
-    return A[idx], float(centers[idx])
-
-def pick_audio_multi(a_npz, offsets: List[float], reduce: str = "mean") -> Tuple[List[np.ndarray], float]:
-    A = a_npz["emb"].astype(np.float32)
-    centers = a_npz["centers_sec"].astype(np.float32)
-    if A.shape[0] == 0:
-        return [], None
-    mid = float(np.median(centers))
-    want = np.array([mid + d for d in offsets], dtype=np.float32)
-    idx = np.clip(np.searchsorted(centers, want), 0, max(0, len(centers) - 1))
-    vecs = [A[i] for i in idx]
-    return vecs, float(mid)
-
 def resample_from_to(y: np.ndarray, t_src: np.ndarray, t_tgt: np.ndarray) -> np.ndarray:
-    """Resample y(t_src) onto t_tgt (both in seconds). Preserves integral ~1."""
     u_src = (t_src - t_src.min()) / max(1e-8, (t_src.max() - t_src.min()))
     u_tgt = (t_tgt - t_tgt.min()) / max(1e-8, (t_tgt.max() - t_tgt.min()))
     y_tgt = np.interp(u_tgt, u_src, y).astype(np.float32)
@@ -96,29 +117,45 @@ def resample_to_len(y: np.ndarray, t_src: np.ndarray, out_len: int) -> Tuple[np.
     s = float(y_tgt.sum())
     if s > 0:
         y_tgt /= s
-    # also return seconds grid for convenience
     t_tgt = np.linspace(t_src.min(), t_src.max(), out_len, dtype=np.float32)
     return y_tgt, t_tgt
 
 def evaluate_hit(t_hat: float, gs: float, ge: float, deltas=(0.25, 0.5, 1.0)):
     mid = 0.5 * (gs + ge)
-    out = {
-        "mae_mid": abs(t_hat - mid),
-        "inside": float(gs <= t_hat <= ge),
-    }
+    out = {"mae_mid": abs(t_hat - mid), "inside": float(gs <= t_hat <= ge)}
     for d in deltas:
         out[f"hit@{d}"] = float(abs(t_hat - mid) <= d)
     return out
 
-# ---------- model ----------
+# ------------------ audio picking ------------------
+def pick_audio_single(a_npz) -> Tuple[np.ndarray, float]:
+    A = a_npz["emb"].astype(np.float32)
+    centers = a_npz["centers_sec"].astype(np.float32)
+    if A.shape[0] == 0:
+        return None, None
+    mid = float(np.median(centers))
+    idx = int(np.argmin(np.abs(centers - mid)))
+    return A[idx], float(centers[idx])
 
-class Refiner(torch.nn.Module):
+def pick_audio_multi(a_npz, offsets: List[float]) -> Tuple[List[np.ndarray], float]:
+    A = a_npz["emb"].astype(np.float32)
+    centers = a_npz["centers_sec"].astype(np.float32)
+    if A.shape[0] == 0:
+        return [], None
+    mid = float(np.median(centers))
+    want = np.array([mid + d for d in offsets], dtype=np.float32)
+    idx = np.clip(np.searchsorted(centers, want), 0, max(0, len(centers) - 1))
+    vecs = [A[i] for i in idx]
+    return vecs, float(mid)
+
+# ------------------ tiny refiner ------------------
+class Refiner(nn.Module):
     def __init__(self, D=128):
         super().__init__()
-        self.net = torch.nn.Sequential(
-            torch.nn.Linear(D, 256),
-            torch.nn.ReLU(inplace=True),
-            torch.nn.Linear(256, D),
+        self.net = nn.Sequential(
+            nn.Linear(D, 256),
+            nn.ReLU(inplace=True),
+            nn.Linear(256, D),
         )
         self.D = D
 
@@ -127,15 +164,55 @@ class Refiner(torch.nn.Module):
         logits = self.net(x)
         return torch.softmax(logits, dim=-1)
 
-# ---------- main ----------
+def load_refiner_from_ckpt(path: str, device: str, D_fallback: int) -> Refiner:
+    # try to discover D from checkpoint
+    D = D_fallback
+    try:
+        raw = torch.load(path, map_location=device)
+        if isinstance(raw, dict) and "D" in raw:
+            D = int(raw["D"])
+    except Exception:
+        pass
 
+    model = Refiner(D=D).to(device).float().eval()
+
+    # robust state_dict loading
+    try:
+        ckpt = torch.load(path, map_location=device, weights_only=True)  # torch>=2.4 recommends this
+    except TypeError:
+        ckpt = torch.load(path, map_location=device)
+
+    state_dict = None
+    if isinstance(ckpt, nn.Module):
+        state_dict = ckpt.state_dict()
+    elif isinstance(ckpt, dict):
+        state_dict = ckpt.get("state_dict") or ckpt.get("model_state_dict")
+        if state_dict is None and all(isinstance(k, str) for k in ckpt.keys()):
+            state_dict = ckpt
+    if state_dict is None:
+        # last fallback
+        ckpt = torch.load(path, map_location=device, weights_only=False)
+        if isinstance(ckpt, nn.Module):
+            state_dict = ckpt.state_dict()
+        elif isinstance(ckpt, dict):
+            state_dict = ckpt.get("state_dict") or ckpt.get("model_state_dict")
+
+    if state_dict is None:
+        raise RuntimeError(f"Unrecognized checkpoint format at {path}")
+
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    if missing or unexpected:
+        print(f"⚠️  load_state_dict: missing={len(missing)} unexpected={len(unexpected)}")
+    return model
+
+# ------------------ main ------------------
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--vid_emb_dir", default="cache/vid_emb")
     ap.add_argument("--aud_emb_dir", default="cache/aud_emb")
     ap.add_argument("--annotations_csv", default="data/ave/ave_annotations.csv")
-    ap.add_argument("--summary_csv", default="reports/summary_refined.csv")
-    ap.add_argument("--curve_dir", default="reports/curves_refined")
+    ap.add_argument("--summary_csv", default="reports/summary_refiner.csv")
+    ap.add_argument("--curve_dir", default="reports/curves_refiner")
 
     ap.add_argument("--L_sec", type=float, default=1.0)
     ap.add_argument("--tau", type=float, default=0.07)
@@ -145,114 +222,73 @@ def main():
     ap.add_argument("--score_zscore", action="store_true")
     ap.add_argument("--score_smooth_sigma", type=float, default=1.0)
     ap.add_argument("--tau_adapt", type=float, default=3.5)
+    ap.add_argument("--pred_softargmax", action="store_true")
 
     ap.add_argument("--refiner_ckpt", default="checkpoints/refiner/refiner.pt")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--grid_D", type=int, default=128)
 
     ap.add_argument("--hit_deltas", type=float, nargs="+", default=[0.25, 0.5, 1.0])
-    ap.add_argument("--plot_n", type=int, default=0)
-
-    ap.add_argument("--pred_softargmax", action="store_true",
-                help="use soft-argmax for prediction instead of hard argmax")
-    
+    ap.add_argument("--plot_n", type=int, default=20)
     args = ap.parse_args()
 
-    os.makedirs(args.curve_dir, exist_ok=True)
+    _ensure_dir(args.curve_dir)
 
-    # load model
-    # --- load model safely ---
-    import torch.nn as nn
+    # --- load GT spans/labels ---
+    ann_df = pd.read_csv(args.annotations_csv)
+    if "video_id" not in ann_df.columns:
+        if "yt_id" in ann_df.columns:
+            ann_df = ann_df.rename(columns={"yt_id": "video_id"})
+        else:
+            ann_df = ann_df.rename(columns={ann_df.columns[0]: "video_id"})
+    gt_map = {}
+    for vid, sub in ann_df.groupby("video_id"):
+        if {"start_s", "end_s"}.issubset(sub.columns):
+            s, e = float(sub["start_s"].iloc[0]), float(sub["end_s"].iloc[0])
+        elif {"gt_start", "gt_end"}.issubset(sub.columns):
+            s, e = float(sub["gt_start"].iloc[0]), float(sub["gt_end"].iloc[0])
+        else:
+            s, e = 0.0, 10.0
+        key = os.path.splitext(os.path.basename(str(vid)))[0]
+        gt_map[key] = (s, e)
 
-    def _load_refiner_checkpoint(path, device, model: nn.Module):
-        # Try safe load first (suppresses the FutureWarning)
-        try:
-            ckpt = torch.load(path, map_location=device, weights_only=True)
-        except TypeError:
-            ckpt = torch.load(path, map_location=device)
-
-        # Normalize to a state_dict format
-        state_dict = None
-        if isinstance(ckpt, nn.Module):
-            state_dict = ckpt.state_dict()
-        elif isinstance(ckpt, dict):
-            if "state_dict" in ckpt and isinstance(ckpt["state_dict"], dict):
-                state_dict = ckpt["state_dict"]
-            elif "model_state_dict" in ckpt and isinstance(ckpt["model_state_dict"], dict):
-                state_dict = ckpt["model_state_dict"]
-            else:
-                if all(isinstance(k, str) for k in ckpt.keys()):
-                    state_dict = ckpt
-
-        # fallback for non-standard saves
-        if state_dict is None:
-            ckpt = torch.load(path, map_location=device, weights_only=False)
-            if isinstance(ckpt, nn.Module):
-                state_dict = ckpt.state_dict()
-            elif isinstance(ckpt, dict):
-                state_dict = ckpt.get("state_dict") or ckpt.get("model_state_dict") or (
-                    ckpt if all(isinstance(k, str) for k in ckpt.keys()) else None
-                )
-
-        if state_dict is None:
-            raise RuntimeError(f"Unrecognized checkpoint format at {path}")
-
-        missing, unexpected = model.load_state_dict(state_dict, strict=False)
-        if missing or unexpected:
-            print(f"⚠️  load_state_dict(strict=False): missing={len(missing)} unexpected={len(unexpected)}")
-            for k in missing[:5]: print("   missing:", k)
-            for k in unexpected[:5]: print("   unexpected:", k)
-
-        return model
-
-
-    # --- instantiate and load ---
+    # --- load refiner ---
     print(f"Loading refiner checkpoint from {args.refiner_ckpt} ...")
+    model = load_refiner_from_ckpt(args.refiner_ckpt, args.device, args.grid_D)
+    D = model.D
+    print(f"✓ Loaded refiner (D={D})")
 
-    # Build model — if checkpoint has D, use it; else fall back to args.grid_D
-    try:
-        ckpt = torch.load(args.refiner_ckpt, map_location=args.device)
-        D = int(ckpt.get("D", args.grid_D)) if isinstance(ckpt, dict) else args.grid_D
-    except Exception:
-        D = args.grid_D
-
-    model = Refiner(D=D).to(args.device).float().eval()
-    model = _load_refiner_checkpoint(args.refiner_ckpt, args.device, model)
-    print(f"✓ Loaded refiner from {args.refiner_ckpt}")
-
-    # index files
+    # --- index embeddings ---
     vid_npzs = sorted(glob(os.path.join(args.vid_emb_dir, "*.npz")))
     aud_npzs = sorted(glob(os.path.join(args.aud_emb_dir, f"*__L{int(args.L_sec*1000)}ms.npz")))
 
-    def key_from_vid(p):
-        return os.path.splitext(os.path.basename(p))[0]
-    def key_from_aud(p):
-        stem = os.path.splitext(os.path.basename(p))[0]
-        return stem.split("__L")[0]
+    def key_from_vid(p): return os.path.splitext(os.path.basename(p))[0]
+    def key_from_aud(p): return os.path.splitext(os.path.basename(p))[0].split("__L")[0]
 
     vids = {key_from_vid(p): p for p in vid_npzs}
     auds = {key_from_aud(p): p for p in aud_npzs}
-    keys = sorted(set(vids.keys()) & set(auds.keys()))
+    keys = sorted(set(vids.keys()) & set(auds.keys()) & set(gt_map.keys()))
     if not keys:
-        print("[error] No overlapping video/audio NPZs. Check paths.")
+        print("[error] No overlapping ids across video/audio/annotations.")
         return
 
     rows = []
+    n_plotted = 0
     print(f"→ Evaluating with refiner on {len(keys)} clips.")
     for k in tqdm(keys, desc="Eval+Refine", unit="clip"):
         v_npz = np.load(vids[k])
         a_npz = np.load(auds[k])
 
-        V = v_npz["emb"].astype(np.float32)
-        t_vid = v_npz["centers_sec"].astype(np.float32)
+        V = v_npz["emb"].astype(np.float32)              # (Tv,D)
+        t_vid = v_npz["centers_sec"].astype(np.float32)  # (Tv,)
         if V.shape[0] == 0:
             continue
 
-        # baseline p_fused
+        # --- audio selection ---
         if args.audio_pick == "multi":
             offsets = [float(x) for x in args.multi_offsets.split(",") if x.strip()]
-            a_list, a_center = pick_audio_multi(a_npz, offsets=offsets, reduce=args.multi_reduce)
-            if len(a_list) == 0:
+            a_list, a_center = pick_audio_multi(a_npz, offsets=offsets)
+            if len(a_list) == 0:  # safety
                 continue
         else:
             a_vec, a_center = pick_audio_single(a_npz)
@@ -260,7 +296,8 @@ def main():
                 continue
             a_list = [a_vec]
 
-        pdfs = []
+        # --- baseline: similarity -> (optional zscore/smooth) -> softmax -> fuse ---
+        pdfs, sims_for_plot = [], []
         for a in a_list:
             sim = cosine_sim(a, V)
             if args.score_zscore:
@@ -269,61 +306,116 @@ def main():
                 sim = gaussian_smooth(sim, args.score_smooth_sigma)
             tau_use = adapt_tau(sim, args.tau_adapt) if args.tau_adapt > 0 else args.tau
             p = softmax(sim, tau=tau_use)
-            pdfs.append(p)
-        pdfs = np.stack(pdfs, 0)
-        p_fused = pdfs.max(0) if args.multi_reduce == "max" else pdfs.mean(0)
-        p_fused = p_fused / (p_fused.sum() + 1e-12)
+            pdfs.append(p); sims_for_plot.append(sim)
 
-        # resample to refiner grid, refine, map back to original Tv
-        p_grid, t_grid = resample_to_len(p_fused, t_vid, D)
+        p_base = (np.stack(pdfs, 0).max(0) if args.multi_reduce == "max"
+                  else np.stack(pdfs, 0).mean(0))
+        p_base = p_base / (p_base.sum() + 1e-12)
+        sim_plot = np.stack(sims_for_plot, 0).mean(0)
+
+        # baseline prediction
+        if args.pred_softargmax:
+            pred_base_t = soft_argmax(t_vid, p_base)
+        else:
+            pred_base_t = float(t_vid[int(np.argmax(p_base))])
+
+        # --- refine on a fixed grid of length D, then map back to Tv ---
+        p_grid, t_grid = resample_to_len(p_base, t_vid, model.D)
         x = torch.from_numpy(p_grid[None, :]).to(args.device, dtype=torch.float32)
         with torch.inference_mode():
             p_ref = model(x)[0].detach().cpu().numpy().astype(np.float32)  # (D,)
-
-        # map refined PDF back onto original t_vid grid
         p_ref_T = resample_from_to(p_ref, t_grid, t_vid)  # (Tv,)
-        pred_idx = int(np.argmax(p_ref_T))
-        pred_t = float(t_vid[pred_idx])
-        conf = float(p_ref_T[pred_idx])
 
-        # AVE GT span if present in annotations CSV – not available in npz; assume 0..10s
-        gs, ge = 0.0, 10.0
-        metrics = evaluate_hit(pred_t, gs, ge, tuple(args.hit_deltas))
+        if args.pred_softargmax:
+            pred_ref_t = soft_argmax(t_vid, p_ref_T)
+        else:
+            pred_ref_t = float(t_vid[int(np.argmax(p_ref_T))])
+
+        conf = float(p_ref_T.max())  # peak prob after refinement
+
+        # --- metrics vs GT ---
+        gs, ge = gt_map.get(k, (0.0, 10.0))
+        metrics_ref = evaluate_hit(pred_ref_t, gs, ge, tuple(args.hit_deltas))
 
         rows.append({
+            # canonical
             "video_id": k,
-            "t_pred_sec": pred_t,
+            "t_pred_sec": pred_ref_t,
             "gt_start_sec": gs,
             "gt_end_sec": ge,
             "gt_mid_sec": 0.5 * (gs + ge),
             "L_sec": args.L_sec,
-            "tau": args.tau if args.tau_adapt <= 0 else float("nan"),
+            "tau": (args.tau if args.tau_adapt <= 0 else float("nan")),
             "tau_adapt": args.tau_adapt,
             "confidence": conf,
             "entropy": float(entropy(p_ref_T)),
-            "hit_0.25": metrics["hit@0.25"],
-            "hit_0.5":  metrics["hit@0.5"],
-            "hit_1.0":  metrics["hit@1.0"],
-            "mae":      metrics["mae_mid"],
-            "inside":   metrics["inside"],
+            "hit_0.25": metrics_ref["hit@0.25"],
+            "hit_0.5":  metrics_ref["hit@0.5"],
+            "hit_1.0":  metrics_ref["hit@1.0"],
+            "mae":      metrics_ref["mae_mid"],
+            "inside":   metrics_ref["inside"],
+            # extras for debugging
+            "pred_base_t": pred_base_t,
+            "pred_ref_t": pred_ref_t,
         })
 
-    if rows:
-        df = pd.DataFrame(rows)
-        os.makedirs(os.path.dirname(args.summary_csv), exist_ok=True)
-        df.to_csv(args.summary_csv, index=False)
-        agg = {
-            "N": int(len(df)),
-            "MAE_mean": float(df["mae"].mean()),
-            "Inside_mean": float(df["inside"].mean()),
-            "Hit@0.25": float(df["hit_0.25"].mean()),
-            "Hit@0.5":  float(df["hit_0.5"].mean()),
-            "Hit@1.0":  float(df["hit_1.0"].mean()),
-            "Conf_mean": float(df["confidence"].mean()),
-        }
-        print("→ Summary:", agg)
-    else:
-        print("[warn] No rows written.")
+        # plot a few examples
+        if n_plotted < args.plot_n:
+            title = (f"{k} | base={pred_base_t:.2f}s, ref={pred_ref_t:.2f}s | "
+                     f"GT=[{gs:.2f},{ge:.2f}]")
+            out_png = os.path.join(args.curve_dir, f"{k}.png")
+            plot_curve_dual(out_png, t_vid, sim_plot, p_base, p_ref_T,
+                            pred_base_t, pred_ref_t, gs, ge, title)
+            n_plotted += 1
+
+    # --- write outputs ---
+    if not rows:
+        print("[warn] No rows written (empty rows).")
+        return
+
+    df = pd.DataFrame(rows)
+    _ensure_dir(os.path.dirname(args.summary_csv))
+    df.to_csv(args.summary_csv, index=False)
+
+    summary = {
+        "N": int(len(df)),
+        "MAE_mean": float(df["mae"].mean()),
+        "MAE_median": float(df["mae"].median()),
+        "Inside_mean": float(df["inside"].mean()),
+        "Hit@0.25": float(df["hit_0.25"].mean()),
+        "Hit@0.5":  float(df["hit_0.5"].mean()),
+        "Hit@1.0":  float(df["hit_1.0"].mean()),
+        "Conf_mean": float(df["confidence"].mean()),
+    }
+    print("→ Summary:", summary)
+
+    # logs and quick artifacts into curve_dir
+    with open(os.path.join(args.curve_dir, "summary.json"), "w") as f:
+        json.dump(summary, f, indent=2)
+    with open(os.path.join(args.curve_dir, "args.json"), "w") as f:
+        json.dump(vars(args), f, indent=2)
+    with open(os.path.join(args.curve_dir, "summary.txt"), "w") as f:
+        f.write("=== Eval+Refiner Summary ===\n")
+        for k, v in summary.items():
+            f.write(f"{k}: {v}\n")
+        f.write("\n=== Args ===\n")
+        for k, v in vars(args).items():
+            f.write(f"{k}: {v}\n")
+
+    df.sort_values("mae", ascending=False).head(50).to_csv(
+        os.path.join(args.curve_dir, "worst50.csv"), index=False
+    )
+    df.sort_values("mae", ascending=True).head(50).to_csv(
+        os.path.join(args.curve_dir, "best50.csv"), index=False
+    )
+
+    if HAVE_PLT and "mae" in df.columns:
+        plt.figure(figsize=(6, 4))
+        plt.hist(df["mae"].values, bins=40)
+        plt.xlabel("MAE (sec)"); plt.ylabel("Count"); plt.title("Refined MAE distribution")
+        plt.tight_layout()
+        plt.savefig(os.path.join(args.curve_dir, "hist_mae_refined.png"), dpi=140)
+        plt.close()
 
 if __name__ == "__main__":
     main()
