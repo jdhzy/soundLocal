@@ -5,6 +5,8 @@ import torch.nn.functional as F
 import torchaudio as ta
 from torchvision.models.video import mc3_18, MC3_18_Weights
 
+
+
 try:
     _is_bf16_supported = torch.cuda.is_bf16_supported  # PyTorch ≥ 2.1
 except AttributeError:
@@ -92,34 +94,34 @@ class FrozenMC3(nn.Module):
         self._on_device = False
 
 
-def _ensure_on_device(self):
-    """Move modules to device and align dtypes (video: fp16, audio: fp32)."""
-    if getattr(self, "_on_device", False):
-        return
+    def _ensure_on_device(self):
+        """Move modules to device and align dtypes (video: fp16, audio: fp32)."""
+        if getattr(self, "_on_device", False):
+            return
 
-    if self.device.type == "cuda":
-        torch.cuda.empty_cache()
+        if self.device.type == "cuda":
+            torch.cuda.empty_cache()
 
-    # VIDEO: backbone uses fp16 (mixed precision)
-    _fp16_except_norms(self.vid_backbone)
-    self.vid_backbone.to(self.device, memory_format=_CHANNELS_LAST_3D, non_blocking=True)
+        # VIDEO: backbone uses fp16 (mixed precision)
+        _fp16_except_norms(self.vid_backbone)
+        self.vid_backbone.to(self.device, memory_format=_CHANNELS_LAST_3D, non_blocking=True)
 
-    # Make video head dtype match backbone
-    bb_dtype = next(self.vid_backbone.parameters()).dtype  # should be float16
-    self.vid_head.to(self.device, dtype=bb_dtype, memory_format=_CHANNELS_LAST_3D, non_blocking=True)
-    self._bb_dtype = bb_dtype  # ✅ store for later
+        # Make video head dtype match backbone
+        bb_dtype = next(self.vid_backbone.parameters()).dtype  # should be float16
+        self.vid_head.to(self.device, dtype=bb_dtype, memory_format=_CHANNELS_LAST_3D, non_blocking=True)
+        self._bb_dtype = bb_dtype  # ✅ store for later
 
-    # AUDIO: keep projector fp32
-    _fp32_module(self.aud_head)
-    self.aud_head.to(self.device, dtype=torch.float32, non_blocking=True)
-    self.melspec.to(self.device)
-    self.db.to(self.device)
+        # AUDIO: keep projector fp32
+        _fp32_module(self.aud_head)
+        self.aud_head.to(self.device, dtype=torch.float32, non_blocking=True)
+        self.melspec.to(self.device)
+        self.db.to(self.device)
 
-    # stats → device
-    self.img_mean = self.img_mean.to(self.device, non_blocking=True)
-    self.img_std  = self.img_std.to(self.device, non_blocking=True)
+        # stats → device
+        self.img_mean = self.img_mean.to(self.device, non_blocking=True)
+        self.img_std  = self.img_std.to(self.device, non_blocking=True)
 
-    self._on_device = True
+        self._on_device = True
 
 
     def encode_video(self, clip: torch.Tensor) -> torch.Tensor:
