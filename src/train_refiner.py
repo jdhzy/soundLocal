@@ -1,225 +1,281 @@
-# src/train_refiner.py
-import argparse, os, math, json
-from glob import glob
-from typing import Tuple, List
-import numpy as np
-import pandas as pd
-from tqdm import tqdm
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 
+import os, argparse, math, json
+from glob import glob
+from typing import List, Tuple, Dict
+
+import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+from tqdm import tqdm
 
-# ---------- helpers copied/trimmed from your eval ----------
-def extract_youtube_id(stem: str) -> str:
-    # your stems already are yt ids; keep passthrough
-    return stem
+# ----------------------------- utilities -----------------------------
 
-def cosine_sim(a_vec: np.ndarray, V: np.ndarray) -> np.ndarray:
-    # V: (T,D), a_vec: (D,)
-    denom = (np.linalg.norm(V, axis=1) * (np.linalg.norm(a_vec) + 1e-8)) + 1e-8
-    return (V @ a_vec) / denom
+def l2normalize(x: np.ndarray, axis=-1, eps=1e-8):
+    n = np.linalg.norm(x, axis=axis, keepdims=True) + eps
+    return x / n
 
-def softmax(sim: np.ndarray, tau: float) -> np.ndarray:
-    z = (sim / max(tau, 1e-6))
-    z -= z.max()
-    p = np.exp(z)
-    return p / (p.sum() + 1e-12)
+def cosine_sim(a: np.ndarray, V: np.ndarray) -> np.ndarray:
+    """a: (D,), V: (T,D) -> (T,)"""
+    a = l2normalize(a.astype(np.float32), axis=0)
+    V = l2normalize(V.astype(np.float32), axis=1)
+    return (V @ a).astype(np.float32)
 
-def zscore(x: np.ndarray) -> np.ndarray:
-    mu, sd = x.mean(), x.std() + 1e-8
-    return (x - mu) / sd
+def zscore(x: np.ndarray, eps=1e-6):
+    m, s = x.mean(), x.std()
+    s = s if s > eps else eps
+    return ((x - m) / s).astype(np.float32)
 
 def gaussian_smooth(x: np.ndarray, sigma: float) -> np.ndarray:
-    if sigma <= 0: return x
-    radius = int(3*sigma)
-    k = np.arange(-radius, radius+1)
-    w = np.exp(-0.5*(k/sigma)**2)
-    w /= w.sum()
-    return np.convolve(x, w, mode="same")
+    if sigma <= 0:
+        return x.astype(np.float32)
+    # simple discrete 1D gaussian kernel with radius 3*sigma
+    radius = max(1, int(round(3 * sigma)))
+    t = np.arange(-radius, radius + 1, dtype=np.float32)
+    k = np.exp(-(t**2) / (2 * sigma * sigma))
+    k = (k / (k.sum() + 1e-8)).astype(np.float32)
+    return np.convolve(x.astype(np.float32), k, mode="same")
 
-def adapt_tau(sim: np.ndarray, target_H: float, max_iter=20) -> float:
-    # solve tau s.t. entropy(p)=target_H with a tiny binary search
-    lo, hi = 1e-3, 1.0
-    for _ in range(max_iter):
-        mid = (lo+hi)/2
-        p = softmax(sim, tau=mid)
-        H = -(p * np.log(p + 1e-12)).sum()
-        if H > target_H: lo = mid
-        else: hi = mid
-    return (lo+hi)/2
+def softmax(x: np.ndarray, tau: float) -> np.ndarray:
+    z = x.astype(np.float32) / max(tau, 1e-6)
+    z = z - z.max()
+    p = np.exp(z)
+    p = p / (p.sum() + 1e-12)
+    return p.astype(np.float32)
 
-def pick_audio_single(a_npz) -> Tuple[np.ndarray,float]:
-    A = a_npz["emb"]
-    centers = a_npz["centers_sec"]
-    if len(A)==0: return None, None
-    mid = np.median(centers)
+def entropy(p: np.ndarray) -> float:
+    p = np.clip(p.astype(np.float32), 1e-12, 1.0)
+    return float(-(p * np.log(p)).sum())
+
+def adapt_tau(sim: np.ndarray, target_H: float, tol=1e-3, maxit=20) -> float:
+    """Binary search tau s.t. entropy(softmax(sim/tau)) ≈ target_H."""
+    lo, hi = 1e-3, 10.0
+    for _ in range(maxit):
+        mid = 0.5 * (lo + hi)
+        H = entropy(softmax(sim, tau=mid))
+        if H > target_H:  # too flat -> lower tau
+            hi = mid
+        else:
+            lo = mid
+        if abs(H - target_H) < tol:
+            break
+    return float(0.5 * (lo + hi))
+
+def pick_audio_single(a_npz) -> Tuple[np.ndarray, float]:
+    A = a_npz["emb"].astype(np.float32)            # (Ka, D)
+    centers = a_npz["centers_sec"].astype(np.float32)
+    if A.shape[0] == 0:
+        return None, None
+    mid = float(np.median(centers))
     idx = int(np.argmin(np.abs(centers - mid)))
     return A[idx], float(centers[idx])
 
-def pick_audio_multi(a_npz, offsets: List[float], reduce="mean"):
-    A = a_npz["emb"]
-    centers = a_npz["centers_sec"]
-    if len(A)==0: return [], None
-    base = float(np.median(centers))
-    target_cs = [base+o for o in offsets]
-    idxs = [int(np.argmin(np.abs(centers - c))) for c in target_cs]
-    vecs = [A[i] for i in idxs]
-    return vecs, base
+def pick_audio_multi(a_npz, offsets: List[float], reduce: str = "mean") -> Tuple[List[np.ndarray], float]:
+    A = a_npz["emb"].astype(np.float32)
+    centers = a_npz["centers_sec"].astype(np.float32)
+    if A.shape[0] == 0:
+        return [], None
+    mid = float(np.median(centers))
+    want = np.array([mid + d for d in offsets], dtype=np.float32)
+    idx = np.clip(np.searchsorted(centers, want), 0, max(0, len(centers) - 1))
+    vecs = [A[i] for i in idx]
+    return vecs, float(mid)
 
-def fuse_pdfs(pdfs: List[np.ndarray], reduce="mean") -> np.ndarray:
-    pdfs = np.stack(pdfs,0)
-    return pdfs.mean(0) if reduce=="mean" else pdfs.max(0)
+def gaussian_target_on_grid(t_vid: np.ndarray, center_s: float, sigma_s: float) -> np.ndarray:
+    """Unnormalized gaussian pdf over video centers, then normalized."""
+    if sigma_s <= 0:
+        # delta-like: put mass at closest index
+        idx = int(np.argmin(np.abs(t_vid - center_s)))
+        p = np.zeros_like(t_vid, dtype=np.float32)
+        p[idx] = 1.0
+        return p
+    d = ((t_vid - center_s) / sigma_s).astype(np.float32)
+    p = np.exp(-0.5 * d * d).astype(np.float32)
+    p = p / (p.sum() + 1e-12)
+    return p
 
-def build_pdf(vid_npz, aud_npz, args) -> Tuple[np.ndarray, np.ndarray]:
-    V = vid_npz["emb"].astype(np.float32)
-    t_vid = vid_npz["centers_sec"].astype(np.float32)
-    if V.shape[0]==0: return None, None
+def resample_to_len(y: np.ndarray, t_src: np.ndarray, out_len: int) -> np.ndarray:
+    """Resample curve y(t_src) to uniform u in [0,1] with out_len points."""
+    if len(y) == 0:
+        return np.zeros((out_len,), dtype=np.float32)
+    u_src = (t_src - t_src.min()) / max(1e-8, (t_src.max() - t_src.min()))
+    u_tgt = np.linspace(0.0, 1.0, out_len, dtype=np.float32)
+    y_tgt = np.interp(u_tgt, u_src, y).astype(np.float32)
+    # renormalize if it's a pdf
+    s = float(y_tgt.sum())
+    if s > 0:
+        y_tgt /= s
+    return y_tgt
+
+# ----------------------------- model -----------------------------
+
+class Refiner(nn.Module):
+    """
+    Tiny MLP that refines a time PDF sampled on a fixed grid (D=128).
+    Input:  (B, D) baseline PDF (or feature)
+    Output: (B, D) refined PDF (softmax-normalized)
+    """
+    def __init__(self, D: int = 128):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(D, 256),
+            nn.ReLU(inplace=True),
+            nn.Linear(256, D),
+        )
+        self.D = D
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Ensure float32 to match weights
+        x = x.float()
+        logits = self.net(x)
+        return torch.softmax(logits, dim=-1)
+
+# ----------------------------- dataset builder -----------------------------
+
+def build_baseline_pdf(v_npz, a_npz, args) -> Tuple[np.ndarray, np.ndarray]:
+    V = v_npz["emb"].astype(np.float32)                  # (Tv, D)
+    t_vid = v_npz["centers_sec"].astype(np.float32)      # (Tv,)
+    if V.shape[0] == 0:
+        return None, None
+
     if args.audio_pick == "multi":
         offsets = [float(x) for x in args.multi_offsets.split(",") if x.strip()]
-        a_list, a_center = pick_audio_multi(aud_npz, offsets, reduce=args.multi_reduce)
+        a_list, a_center = pick_audio_multi(a_npz, offsets=offsets, reduce=args.multi_reduce)
+        if len(a_list) == 0:
+            return None, None
     else:
-        a_vec, a_center = pick_audio_single(aud_npz)
-        a_list = [a_vec] if a_vec is not None else []
-    if len(a_list)==0: return None, None
+        a_vec, a_center = pick_audio_single(a_npz)
+        if a_vec is None:
+            return None, None
+        a_list = [a_vec]
 
     pdfs = []
     for a in a_list:
-        sim = cosine_sim(a, V)
-        if args.score_zscore: sim = zscore(sim)
-        if args.score_smooth_sigma>0: sim = gaussian_smooth(sim, args.score_smooth_sigma)
-        tau_use = adapt_tau(sim, args.tau_adapt) if args.tau_adapt>0 else args.tau
-        pdfs.append(softmax(sim, tau=tau_use))
-    p = fuse_pdfs(pdfs, args.multi_reduce)
-    return t_vid, p
+        sim = cosine_sim(a, V)  # (Tv,)
+        if args.score_zscore:
+            sim = zscore(sim)
+        if args.score_smooth_sigma > 0:
+            sim = gaussian_smooth(sim, sigma=args.score_smooth_sigma)
+        tau_use = adapt_tau(sim, args.tau_adapt) if args.tau_adapt > 0 else args.tau
+        p = softmax(sim, tau=tau_use)
+        pdfs.append(p)
 
-# ---------- refiner model (MLP on 128-bin logits) ----------
-class Refiner(nn.Module):
-    def __init__(self, bins=128, hidden=256):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(bins, hidden),
-            nn.ReLU(inplace=True),
-            nn.Linear(hidden, hidden),
-            nn.ReLU(inplace=True),
-            nn.Linear(hidden, bins)  # logits
-        )
-    def forward(self, x):  # x: (B, bins)
-        return self.net(x)
+    pdfs = np.stack(pdfs, axis=0)
+    if args.multi_reduce == "max":
+        p_fused = pdfs.max(axis=0)
+    else:
+        p_fused = pdfs.mean(axis=0)
+    # normalize again for safety
+    p_fused = p_fused / (p_fused.sum() + 1e-12)
+    return p_fused.astype(np.float32), t_vid.astype(np.float32)
 
-def resample_to_fixed(t: np.ndarray, p: np.ndarray, bins=128):
-    # interpolate PDF p(t) onto [0,1] with 'bins' points
-    if t.min()<0: t = t - t.min()
-    if t.max()==0: t = t + 1e-6
-    ti = (t - t.min()) / (t.max()-t.min())
-    grid = np.linspace(0,1,bins)
-    pi = np.interp(grid, ti, p)
-    pi = np.clip(pi, 1e-12, None)
-    pi = pi / pi.sum()
-    return grid, pi
-
-def gaussian_target(mid_s: float, t_min: float, t_max: float, bins=128, sigma_s=0.5):
-    # make a Gaussian around the mid-point in seconds, sampled on [t_min,t_max]
-    grid = np.linspace(t_min, t_max, bins)
-    w = np.exp(-0.5*((grid - mid_s)/max(sigma_s,1e-6))**2)
-    w = np.clip(w, 1e-12, None)
-    w = w / w.sum()
-    return w
-
-def kl_loss(pred_log_probs, target_probs):
-    # pred_log_probs: (B,bins), target_probs: (B,bins)
-    return F.kl_div(pred_log_probs, target_probs, reduction="batchmean")
+# ----------------------------- training -----------------------------
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--vid_emb_dir", default="cache/vid_emb")
-    ap.add_argument("--aud_emb_dir", default="cache/aud_emb")
-    ap.add_argument("--annotations_csv", default="data/ave/ave_annotations.csv")
-    ap.add_argument("--L_sec", type=float, default=1.0)
-    ap.add_argument("--tau", type=float, default=0.07)
-    ap.add_argument("--audio_pick", choices=["middle","multi"], default="multi")
-    ap.add_argument("--multi_offsets", type=str, default="0,0.25,-0.25")
-    ap.add_argument("--multi_reduce", choices=["mean","max"], default="mean")
-    ap.add_argument("--score_zscore", action="store_true")
-    ap.add_argument("--score_smooth_sigma", type=float, default=1.0)
-    ap.add_argument("--tau_adapt", type=float, default=3.5)
-    # training
-    ap.add_argument("--bins", type=int, default=128)
-    ap.add_argument("--epochs", type=int, default=5)
-    ap.add_argument("--batch_size", type=int, default=256)
-    ap.add_argument("--lr", type=float, default=1e-3)
-    ap.add_argument("--sigma_target", type=float, default=0.5)
-    ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
-    ap.add_argument("--out_dir", default="checkpoints/refiner")
-    args = ap.parse_args()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--vid_emb_dir", default="cache/vid_emb")
+    parser.add_argument("--aud_emb_dir", default="cache/aud_emb")
+    parser.add_argument("--annotations_csv", default="data/ave/ave_annotations.csv")
+    parser.add_argument("--L_sec", type=float, default=1.0)
+    parser.add_argument("--tau", type=float, default=0.07)
+    parser.add_argument("--audio_pick", choices=["middle", "multi"], default="multi")
+    parser.add_argument("--multi_offsets", type=str, default="0,0.25,-0.25")
+    parser.add_argument("--multi_reduce", choices=["mean", "max"], default="mean")
+    parser.add_argument("--score_zscore", action="store_true")
+    parser.add_argument("--score_smooth_sigma", type=float, default=1.0)
+    parser.add_argument("--tau_adapt", type=float, default=3.5)
+    parser.add_argument("--sigma_target", type=float, default=0.5, help="GT gaussian sigma in seconds")
+    parser.add_argument("--epochs", type=int, default=5)
+    parser.add_argument("--batch_size", type=int, default=256)
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--out_dir", default="checkpoints/refiner")
+    parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--grid_D", type=int, default=128, help="refiner input/output length")
+    args = parser.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
 
-    # load annotations
-    ann_df = pd.read_csv(args.annotations_csv)
-    if "video_id" not in ann_df.columns:
-        ann_df = ann_df.rename(columns={"yt_id":"video_id"} if "yt_id" in ann_df.columns else {ann_df.columns[0]:"video_id"})
-    gt_map = {}
-    for vid, sub in ann_df.groupby("video_id"):
-        s = float(sub.get("start_s", sub.get("gt_start", pd.Series([0.0]))).iloc[0])
-        e = float(sub.get("end_s", sub.get("gt_end",   pd.Series([10.0]))).iloc[0])
-        gt_map[extract_youtube_id(vid)] = (s, e)
+    # Index files
+    vid_npzs = sorted(glob(os.path.join(args.vid_emb_dir, "*.npz")))
+    aud_npzs = sorted(glob(os.path.join(args.aud_emb_dir, f"*__L{int(args.L_sec*1000)}ms.npz")))
 
-    # index NPZs
-    vid_npzs = {extract_youtube_id(os.path.splitext(os.path.basename(p))[0]): p
-                for p in glob(os.path.join(args.vid_emb_dir,"*.npz"))}
-    aud_npzs = {}
-    for p in glob(os.path.join(args.aud_emb_dir, f"*__L{int(args.L_sec*1000)}ms.npz")):
+    def key_from_vid(p):
+        return os.path.splitext(os.path.basename(p))[0]
+    def key_from_aud(p):
         stem = os.path.splitext(os.path.basename(p))[0]
-        vid = stem.split("__L")[0]
-        aud_npzs[extract_youtube_id(vid)] = p
-    keys = sorted(set(vid_npzs) & set(aud_npzs) & set(gt_map))
-    print(f"Building dataset from {len(keys)} clips...")
+        return stem.split("__L")[0]
 
+    vids = {key_from_vid(p): p for p in vid_npzs}
+    auds = {key_from_aud(p): p for p in aud_npzs}
+    keys = sorted(set(vids.keys()) & set(auds.keys()))
+    if not keys:
+        print("[error] No overlapping video/audio NPZs. Check paths.")
+        return
+
+    # Build dataset
     X, Y = [], []
+    print(f"Building dataset from {len(keys)} clips...")
     for k in tqdm(keys):
-        vnpz = np.load(vid_npzs[k])
-        anpz = np.load(aud_npzs[k])
-        t, p = build_pdf(vnpz, anpz, args)
-        if t is None: continue
-        # input: resampled PDF on [0,1]
-        _, pi = resample_to_fixed(t, p, bins=args.bins)
-        # target: Gaussian around midpoint on [t_min,t_max]
-        s,e = gt_map[k]
-        target = gaussian_target((s+e)/2, t_min=t.min(), t_max=t.max(), bins=args.bins, sigma_s=args.sigma_target)
-        X.append(pi.astype(np.float32))
-        Y.append(target.astype(np.float32))
+        v_npz = np.load(vids[k])
+        a_npz = np.load(auds[k])
 
-    X = torch.tensor(np.stack(X), device=args.device)
-    Y = torch.tensor(np.stack(Y), device=args.device)
+        p_fused, t_vid = build_baseline_pdf(v_npz, a_npz, args)
+        if p_fused is None:
+            continue
+
+        # GT midpoint (AVE: if absent, 5s)
+        gt_start = float(v_npz.get("gt_start_sec", 0.0)) if "gt_start_sec" in v_npz else 0.0
+        gt_end   = float(v_npz.get("gt_end_sec",   10.0)) if "gt_end_sec"   in v_npz else 10.0
+        mid = 0.5 * (gt_start + gt_end)
+
+        tgt_T = gaussian_target_on_grid(t_vid, center_s=mid, sigma_s=args.sigma_target)
+        x = resample_to_len(p_fused, t_vid, args.grid_D)
+        y = resample_to_len(tgt_T,   t_vid, args.grid_D)
+
+        X.append(x.astype(np.float32))
+        Y.append(y.astype(np.float32))
+
+    if len(X) == 0:
+        print("[error] Empty dataset.")
+        return
+
+    X = torch.from_numpy(np.stack(X, axis=0)).to(args.device, dtype=torch.float32)
+    Y = torch.from_numpy(np.stack(Y, axis=0)).to(args.device, dtype=torch.float32)
     print("Dataset:", X.shape, Y.shape)
 
-    model = Refiner(bins=args.bins, hidden=256).to(args.device)
-    opt = torch.optim.AdamW(model.parameters(), lr=args.lr)
-    best = math.inf
+    # Model / Optim
+    model = Refiner(D=args.grid_D).to(args.device).float()
+    opt = torch.optim.Adam(model.parameters(), lr=args.lr)
+    # KLDivLoss expects log-prob input; our model returns prob -> take log
+    kld = nn.KLDivLoss(reduction="batchmean")
 
-    for ep in range(1, args.epochs+1):
+    best = math.inf
+    for ep in range(1, args.epochs + 1):
         model.train()
-        total = 0.0
-        for i in range(0, len(X), args.batch_size):
-            xb = X[i:i+args.batch_size]
-            yb = Y[i:i+args.batch_size]
+        perm = torch.randperm(X.size(0), device=args.device)
+        losses = []
+        for i in range(0, X.size(0), args.batch_size):
+            idx = perm[i:i + args.batch_size]
+            xb = X[idx]
+            yb = Y[idx]
+
+            pb = model(xb)                       # prob
+            loss = kld((pb + 1e-12).log(), yb)  # KL(p || y): y is target
             opt.zero_grad(set_to_none=True)
-            logits = model(xb)                 # (B,bins)
-            logp = F.log_softmax(logits, dim=-1)
-            loss = kl_loss(logp, yb)
             loss.backward()
             opt.step()
-            total += float(loss.item()) * xb.size(0)
-        avg = total / len(X)
-        print(f"[ep {ep}] loss={avg:.4f}")
-        if avg < best:
-            best = avg
-            ckpt = os.path.join(args.out_dir, "refiner.pt")
-            torch.save({"model": model.state_dict(), "bins": args.bins}, ckpt)
-            with open(os.path.join(args.out_dir, "train_cfg.json"), "w") as f:
-                json.dump(vars(args), f, indent=2)
-            print(f"  ✓ saved {ckpt} (best so far)")
+            losses.append(loss.item())
+
+        mean_loss = float(np.mean(losses))
+        print(f"[ep {ep}] loss={mean_loss:.4f}")
+
+        # save best
+        if mean_loss < best:
+            best = mean_loss
+            path = os.path.join(args.out_dir, "refiner.pt")
+            torch.save({"state_dict": model.state_dict(), "D": args.grid_D}, path)
+            print(f"  ✓ saved {path} (best so far)")
 
 if __name__ == "__main__":
     main()
