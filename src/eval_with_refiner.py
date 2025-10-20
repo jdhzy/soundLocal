@@ -343,7 +343,6 @@ def main():
         else:
             conf = float(p_ref_T[pred_idx])
 
-        entropy = float(entropy(p_ref_T))
 
         #conf = float(p_ref_T.max())  # peak prob after refinement
 
