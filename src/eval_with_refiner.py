@@ -230,6 +230,9 @@ def main():
 
     ap.add_argument("--hit_deltas", type=float, nargs="+", default=[0.25, 0.5, 1.0])
     ap.add_argument("--plot_n", type=int, default=20)
+    ap.add_argument("--conf_radius_s", type=float, default=0.5,
+                help="radius (sec) around t̂ to sum PDF for confidence; 0 -> peak p(t̂)")
+    
     args = ap.parse_args()
 
     _ensure_dir(args.curve_dir)
@@ -328,10 +331,21 @@ def main():
 
         if args.pred_softargmax:
             pred_ref_t = soft_argmax(t_vid, p_ref_T)
+            pred_idx = int(np.argmin(np.abs(t_vid - pred_ref_t)))
         else:
-            pred_ref_t = float(t_vid[int(np.argmax(p_ref_T))])
+            pred_idx = int(np.argmax(p_ref_T))
+            pred_ref_t = float(t_vid[pred_idx])
 
-        conf = float(p_ref_T.max())  # peak prob after refinement
+        # --- improved confidence: local probability mass around prediction ---
+        if getattr(args, "conf_radius_s", 0.0) > 0:
+            mask = np.abs(t_vid - pred_ref_t) <= args.conf_radius_s
+            conf = float(p_ref_T[mask].sum())
+        else:
+            conf = float(p_ref_T[pred_idx])
+
+        entropy = float(entropy(p_ref_T))
+
+        #conf = float(p_ref_T.max())  # peak prob after refinement
 
         # --- metrics vs GT ---
         gs, ge = gt_map.get(k, (0.0, 10.0))

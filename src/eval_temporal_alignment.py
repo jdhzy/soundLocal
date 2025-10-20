@@ -397,7 +397,18 @@ def main(args):
             pred_idx = int(np.argmax(p_fused))
             pred_t = float(t_vid[pred_idx])
 
-        confidence = float(p_fused[pred_idx])
+        # --- compute prediction and confidence ---
+        pred_idx = int(np.argmax(p_fused))
+        pred_t = float(t_vid[pred_idx])
+
+        # improved confidence: local probability mass within ±radius seconds
+        if getattr(args, "conf_radius_s", 0.0) > 0:
+            mask = np.abs(t_vid - pred_t) <= args.conf_radius_s
+            confidence = float(p_fused[mask].sum())
+        else:
+            confidence = float(p_fused[pred_idx])
+
+        entropy = float(-(p_fused * np.log(p_fused + 1e-12)).sum())
         ent = entropy(p_fused)
 
         # --- evaluate vs GT ---
@@ -522,11 +533,14 @@ if __name__ == "__main__":
                     help="Use soft-argmax of the fused PDF (expectation of time).")
     ap.add_argument("--tau_adapt", type=float, default=0.0,
                     help="If >0, adapt τ per-clip to reach this entropy (ignores --tau).")
+    ap.add_argument("--conf_radius_s", type=float, default=0.5,
+                help="radius (sec) around t̂ to sum PDF for confidence; 0 -> peak p(t̂)")
 
     # Plotting & evaluation
     ap.add_argument("--plot_n", type=int, default=20, help="How many examples to plot.")
     ap.add_argument("--hit_deltas", type=float, nargs="+", default=[0.25, 0.5, 1.0],
                     help="Hit@δ thresholds in seconds.")
+    
 
     args = ap.parse_args()
     main(args)
