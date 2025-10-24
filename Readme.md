@@ -11,14 +11,11 @@ The Makefile is there to make setup on SCC painless:
 Creates a Python virtualenv (.venv), upgrades pip, and installs everything from requirements.txt for CPU use.
 	•	make gpu
 Loads SCC modules for Python and CUDA, creates .venv (if missing), installs PyTorch/cu121 wheels, then installs your requirements.txt. Result: a GPU-ready environment.
-	•	make gpu-login
-Starts a 4-hour interactive GPU shell on SCC with one GPU and 24 GB RAM so you can run extraction/eval jobs interactively.
 	•	make clean
 Deletes the .venv to reset your environment.
 	•	make reinstall
 clean + install in one step.
 
-Tip: Run make gpu-login first, then inside that GPU shell do make gpu (so you install the CUDA-enabled wheels in the same environment you’ll use).
 
 ⸻
 
