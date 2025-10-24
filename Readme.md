@@ -1,7 +1,4 @@
-Perfect — here’s a clean, emoji-free, fully Markdown-compliant version of your README.md.
-All headings and tables are properly formatted for GitHub rendering, and it’s 100% copy-pastable.
-
-⸻
+current data and results are in scc /restricted/projectnb/cs599dg/jd/ego4d_mc3_temporal
 
 
 # SoundingActions Temporal Localization  
