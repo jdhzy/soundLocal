@@ -1,51 +1,52 @@
-Got it ✅ — here’s the exact README.md version, properly formatted in Markdown syntax — ready to copy and paste directly into your GitHub repo.
+Perfect — here’s a clean, emoji-free, fully Markdown-compliant version of your README.md.
+All headings and tables are properly formatted for GitHub rendering, and it’s 100% copy-pastable.
 
 ⸻
 
 
-# 🎬 SoundingActions Temporal Localization  
+# SoundingActions Temporal Localization  
 ### (MC3 Evaluation on the AVE Dataset)
 
-This repository evaluates **cross-modal temporal alignment** between **audio** and **video** using the **MC3 backbone** from  
-🧠 *[SoundingActions: Learning How Actions Sound from Narrated Egocentric Videos (Chen et al., CVPR 2024)]*.
+This repository evaluates cross-modal temporal alignment between audio and video using the **MC3 backbone** from  
+*SoundingActions: Learning How Actions Sound from Narrated Egocentric Videos (Chen et al., CVPR 2024)*.
 
-We test how well a **frozen MC3 encoder** can locate when an event’s sound occurs within a 10-second video clip from the **AVE dataset**—without any fine-tuning.
+We test how well a **frozen MC3 encoder** can locate when an event’s sound occurs within a 10-second video clip from the **AVE dataset**, without any fine-tuning.
 
 ---
 
-## 🧰 Environment Setup (Makefile)
+## Environment Setup (Makefile)
 
-The provided **Makefile** automates all setup steps on SCC or local Linux systems.
+The provided Makefile automates all setup steps on SCC or a local Linux system.
 
 | Command | Description |
 |----------|-------------|
 | `make install` | Creates `.venv` using Python 3.12, installs dependencies from `requirements.txt` (CPU). |
 | `make gpu` | Loads Python + CUDA modules, installs PyTorch (CUDA 12.1 wheels), and prepares a GPU-ready environment. |
-| `make gpu-login` | Requests a 4-hour interactive **GPU node** (1 GPU, 24 GB RAM) for experimentation. |
+| `make gpu-login` | Requests a 4-hour interactive GPU node (1 GPU, 24 GB RAM). |
 | `make clean` | Deletes `.venv` to reset the environment. |
 | `make reinstall` | Combines `clean` + `install` to rebuild everything from scratch. |
 
-> 💡 **Tip:**  
-> Run `make gpu-login` first to get a GPU shell, then inside that session run `make gpu` so CUDA wheels install correctly.
+**Tip:**  
+Run `make gpu-login` first to get a GPU shell, then inside that session run `make gpu` so CUDA wheels install correctly.
 
 ---
 
-## 📦 Dataset Setup — AVE (Audio-Visual Event)
+## Dataset Setup — AVE (Audio-Visual Event)
 
-The **AVE dataset** contains 4,097 10-second clips annotated with the start and end times of the sound-producing event.
+The AVE dataset contains 4,097 10-second clips annotated with the start and end times of the sound-producing event.
 
-### 1️⃣ Create directories
+### Step 1: Create directories
 ```bash
 mkdir -p data/ave/raw data/ave/ave_wav
 
-2️⃣ Download and extract videos
+Step 2: Download and extract videos
 
 cd data/ave/raw
 wget http://www.robots.ox.ac.uk/~vgg/data/ave/AVE_Dataset.zip
 unzip AVE_Dataset.zip -d AVE
 cd ../../..
 
-3️⃣ Download annotations
+Step 3: Download annotations
 
 wget http://www.robots.ox.ac.uk/~vgg/data/ave/annotations/AVE_annotation.csv \
   -O data/ave/ave_annotations.csv
@@ -84,7 +85,7 @@ extract_audio_multiscale.py	Multi-scale audio extraction (0.25–5 s windows, va
 Evaluation and Refinement
 
 File	Description
-eval_temporal_alignment.py	Baseline temporal alignment: computes cosine similarity between audio + video embeddings over time → softmax( sim / τ ) → temporal PDF → peak = predicted sound time.
+eval_temporal_alignment.py	Baseline temporal alignment: computes cosine similarity between audio and video embeddings over time → softmax(sim / τ) → temporal PDF → peak = predicted sound time.
 train_refiner.py	Builds a dataset of baseline PDFs and trains a lightweight MLP refiner (Linear 128→256→128 + Softmax) to sharpen them.
 eval_with_refiner.py	Runs evaluation using the trained refiner network to improve temporal precision.
 refiner.py	Defines the standalone refiner network architecture.
@@ -92,7 +93,7 @@ refiner.py	Defines the standalone refiner network architecture.
 
 ⸻
 
-Hyperparameter & Ablation
+Hyperparameter and Ablation
 
 File	Description
 hparam_sweep.py	Grid-search over audio window length (L) and temperature (τ); writes per-run results under reports/grid/.
@@ -102,7 +103,7 @@ ablate_small.py	Quick small-set ablations for z-score, smoothing, and fusion str
 
 ⸻
 
-Analysis & Utilities
+Analysis and Utilities
 
 File	Description
 analyze_results.py	Reads summary.csv, canonicalizes metrics, computes MAE, Hit@δ, Inside, and generates histograms + calibration plots in timestamped reports/analysis/<run_tag>/.
