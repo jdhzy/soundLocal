@@ -57,11 +57,10 @@ data/ave/
 ├── raw/AVE/                # Original .mp4 videos
 ├── ave_annotations.csv     # Ground-truth (start_s, end_s)
 └── ave_wav/                # Audio tracks (.wav) generated later
+```
 
 
-⸻
-
-Source Directory Overview
+## Source Directory Overview
 
 Core Modules
 
@@ -70,9 +69,9 @@ mc3_frozen.py	Defines the frozen MC3 video encoder used for feature extraction. 
 video_windows.py	Video I/O helpers for frame sampling, sliding windows, and center-time generation.
 
 
-⸻
+---
 
-Embedding Extraction
+## Embedding Extraction
 
 File	Description
 extract_video_emb.py	Encodes each MP4 into per-window video embeddings (T, D) using the frozen MC3 model. Saves .npz per video in cache/vid_emb/.
@@ -80,9 +79,9 @@ extract_audio_emb.py	Simple single-scale audio embedding extractor.
 extract_audio_multiscale.py	Multi-scale audio extraction (0.25–5 s windows, variable stride). Saves .npz per (video,length) in cache/aud_emb/.
 
 
-⸻
+---
 
-Evaluation and Refinement
+## Evaluation and Refinement
 
 File	Description
 eval_temporal_alignment.py	Baseline temporal alignment: computes cosine similarity between audio and video embeddings over time → softmax(sim / τ) → temporal PDF → peak = predicted sound time.
@@ -91,9 +90,9 @@ eval_with_refiner.py	Runs evaluation using the trained refiner network to improv
 refiner.py	Defines the standalone refiner network architecture.
 
 
-⸻
+---
 
-Hyperparameter and Ablation
+## Hyperparameter and Ablation
 
 File	Description
 hparam_sweep.py	Grid-search over audio window length (L) and temperature (τ); writes per-run results under reports/grid/.
@@ -101,9 +100,9 @@ hparam_2.py, hparam3.py	Extended sweeps adding stride/window combinations.
 ablate_small.py	Quick small-set ablations for z-score, smoothing, and fusion strategies.
 
 
-⸻
+---
 
-Analysis and Utilities
+## Analysis and Utilities
 
 File	Description
 analyze_results.py	Reads summary.csv, canonicalizes metrics, computes MAE, Hit@δ, Inside, and generates histograms + calibration plots in timestamped reports/analysis/<run_tag>/.
@@ -111,9 +110,9 @@ parse_ave_txt_annotations.py	Converts AVE’s text annotations into CSV format i
 cache/	Local directory for storing intermediate embeddings (vid_emb/, aud_emb/). Safe to delete/rebuild.
 
 
-⸻
+---
 
-Typical Workflow
+## Typical Workflow
 
 # 1. Extract video embeddings
 python src/extract_video_emb.py --vid_dir data/ave/raw/AVE --out_dir cache/vid_emb
