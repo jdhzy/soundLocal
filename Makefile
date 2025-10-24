@@ -42,6 +42,11 @@ gpu:
 > . "$(VENV)/bin/activate"; pip install -r "$(REQ)"
 > echo "✓ GPU environment ready with CUDA + PyTorch."
 
+# ---- Launch a 4-hour interactive GPU session on SCC ----
+gpu-login:
+> echo "→ Requesting interactive GPU node (4 hours, 24GB RAM)..."
+> srun --pty --gres=gpu:1 --mem=24G -t 4:00:00 --partition=gpu bash -l
+> echo "✓ Entered GPU interactive shell."
 # ---- Clean environment ----
 clean:
 > echo "→ Removing virtual environment at $(VENV)"
